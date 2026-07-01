@@ -198,7 +198,6 @@ common_set() {
     rm -f /usr/lib/systemd/system/openstick-startup-diagnose.service || true
     rm -f /usr/lib/systemd/system/openstick-startup-diagnose.timer || true
 
-    # ★ 修复：文件来源路径改为 PKGS_DIR
     local files=(
         "${PKGS_DIR}/mobian-setup-usb-network:/usr/sbin/mobian-setup-usb-network"
         "${PKGS_DIR}/mobian-setup-usb-network.service:/usr/lib/systemd/system/mobian-setup-usb-network.service"
@@ -219,21 +218,56 @@ common_set() {
         fi
     done
 
-    [[ -f /usr/lib/systemd/system/btrfs-compress.service ]] && \
-        systemctl enable btrfs-compress.service || true
+    # ================================================================
+    # ★ 关键修复：启用 USB 网络服务（原脚本缺少此步骤！）
+    #   mobian-setup-usb-network.service 负责在设备启动时
+    #   配置 USB gadget RNDIS 模式并分配 IP 192.168.68.1
+    #   不 enable 则每次开机都不会自动运行，USB 网络永远无法使用
+    # ================================================================
+    log_info "启用开机自启服务..."
+
+    if [[ -f /usr/lib/systemd/system/mobian-setup-usb-network.service ]]; then
+        systemctl enable mobian-setup-usb-network.service || log_warn "enable mobian-setup-usb-network 失败"
+        log_ok "mobian-setup-usb-network.service 已启用（USB RNDIS 网络）"
+    else
+        log_warn "mobian-setup-usb-network.service 不存在，USB 网络将无法工作！"
+    fi
+
+    if [[ -f /usr/lib/systemd/system/btrfs-compress.service ]]; then
+        systemctl enable btrfs-compress.service || log_warn "enable btrfs-compress 失败"
+        log_ok "btrfs-compress.service 已启用"
+    fi
+
+    # ================================================================
+    # ★ 设置 Armbian 默认 SSH 登录账号
+    #   Armbian 基础镜像首次启动强制修改密码会阻止 SSH 登录
+    #   预设密码 1234，与 OpenStick 社区惯例一致
+    # ================================================================
+    log_info "配置默认 root 密码（1234）..."
+    echo "root:1234" | chpasswd || log_warn "root 密码设置失败"
+
+    # 允许 root SSH 登录（嵌入式设备惯例）
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+        log_ok "SSH root 登录已启用"
+    fi
+
+    # ================================================================
+    # ★ 禁用 Armbian 首次登录强制改密码流程
+    #   否则 SSH 登录后会被强制要求改密码，自动化脚本无法使用
+    # ================================================================
+    rm -f /root/.not_logged_in_yet || true
+    # 禁用 armbian-firstlogin PAM 模块
+    sed -i '/armbian-firstlogin/d' /etc/pam.d/login 2>/dev/null || true
+    sed -i '/armbian-firstlogin/d' /etc/pam.d/sshd 2>/dev/null || true
+    log_ok "首次登录强制改密已禁用"
 
     printf 'LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0\n' > /etc/fstab
 
-    # ================================================================
-    # ★ 修复：原 sed -i '13i\nmcli c u USB' 中的 \n 会被解析为字面换行
-    #   导致 sed 收到被截断的 insert 表达式而崩溃
-    #   改用 Python 实现行插入，彻底规避 sed i 命令的兼容性问题
-    # ================================================================
     if [[ -f /etc/rc.local ]]; then
         log_info "修改 rc.local..."
-        # 移除第1行的 -e 标志
         sed -i '1s/ -e//' /etc/rc.local || true
-        # 用 Python 在第13行前插入 mcli 命令
         python3 - << 'PYEOF'
 try:
     with open('/etc/rc.local', 'r') as f:
