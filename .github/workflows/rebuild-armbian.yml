@@ -65,7 +65,7 @@ jobs:
           fi
 
           echo "$RESPONSE" > response.json
-          VERSIONS=$(echo "$RESPONSE" | jq -r '.[] | select(.tag_name | contains("arm64")) | .tag_name' | head -n 10)
+          VERSIONS=$(echo "$RESPONSE" | jq -r '.[] | select(.tag_name | contains("arm64")) | select(.tag_name | test("bookworm|noble")) | .tag_name' | head -n 10)
 
           if [ -z "$VERSIONS" ]; then
             echo "❌ 错误: 未找到任何包含 arm64 的版本"
