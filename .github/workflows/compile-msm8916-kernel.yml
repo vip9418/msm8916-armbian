@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
 
     steps:
-      - name: Initialize the build environment
+      - name: 🛠️ 初始化编译环境
         id: init
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -53,7 +53,7 @@ jobs:
           timedatectl status || true
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Create virtual disk for extended storage
+      - name: 💾 创建虚拟磁盘扩展存储空间
         id: disk
         run: |
           mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
@@ -73,17 +73,10 @@ jobs:
           df -Th
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Clone kernel source
+      - name: 📥 克隆内核源码（分支 ${{ env.KERNEL_BRANCH }}）
         id: clone
         run: |
           cd /builder
-
-          # ================================================================
-          # ★ 关键修正：必须指定 msm8916/6.18 分支
-          # 因为 msm8916_defconfig 只存在于该分支下：
-          #   arch/arm64/configs/msm8916_defconfig
-          # 不指定分支会拉取默认分支，导致 make msm8916_defconfig 报错
-          # ================================================================
           echo "正在克隆内核源码..."
           echo "仓库: https://github.com/${{ env.KERNEL_REPO }}"
           echo "分支: ${{ env.KERNEL_BRANCH }}"
@@ -95,7 +88,6 @@ jobs:
 
           cd kernel
 
-          # 获取内核版本号
           KERNEL_VERSION=$(grep -E "^VERSION = " Makefile | awk '{print $3}')
           KERNEL_PATCHLEVEL=$(grep -E "^PATCHLEVEL = " Makefile | awk '{print $3}')
           KERNEL_SUBLEVEL=$(grep -E "^SUBLEVEL = " Makefile | awk '{print $3}')
@@ -105,7 +97,6 @@ jobs:
           echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_OUTPUT}
           echo "✅ 内核版本: ${FULL_VERSION}"
 
-          # 确认 defconfig 文件存在（早期验证，出错信息更友好）
           echo ""
           echo "════ 验证 defconfig 文件存在性 ════"
           ls -la arch/arm64/configs/ | grep defconfig || true
@@ -113,14 +104,12 @@ jobs:
             echo "✅ arch/arm64/configs/msm8916_defconfig 确认存在"
           else
             echo "❌ 错误: msm8916_defconfig 不存在于当前分支!"
-            echo "   当前分支: ${{ env.KERNEL_BRANCH }}"
-            echo "   请检查 KERNEL_BRANCH 变量是否正确"
             exit 1
           fi
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Cache ccache
+      - name: 📦 恢复 ccache 编译缓存
         uses: actions/cache@v5
         with:
           path: /builder/kernel/.ccache
@@ -128,21 +117,7 @@ jobs:
           restore-keys: |
             msm8916-${{ env.kernel_version }}-
 
-      # ================================================================
-      # ★ 步骤 5：加载基础 defconfig
-      #
-      # 【文件来源完整说明】
-      # 此步骤执行 make msm8916_defconfig，内核构建系统会自动读取：
-      #   /builder/kernel/arch/arm64/configs/msm8916_defconfig
-      # 该文件来自上一步 git clone 下来的外部仓库：
-      #   仓库: Crychic-Band/kernel_ufi_msm8916
-      #   分支: msm8916/6.18
-      #   路径: arch/arm64/configs/msm8916_defconfig
-      #
-      # 用户自己的仓库（vip9418/msm8916-armbian）
-      # 完全不需要建立或存储任何 defconfig 文件！
-      # ================================================================
-      - name: Load base kernel config
+      - name: ⚙️ 加载基础 defconfig
         id: loadconfig
         if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -170,20 +145,7 @@ jobs:
           echo "✅ 基础 .config 已生成"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      # ================================================================
-      # ★ 步骤 6：注入 DAE + Docker 所需内核配置项
-      #
-      # DAE 配置来源（官方文档，逐字对应）：
-      #   https://github.com/daeuniverse/dae/blob/main/docs/en/README.md
-      #
-      # Docker 配置来源（官方验证脚本）：
-      #   https://github.com/docker/docker/blob/master/contrib/check-config.sh
-      #
-      # scripts/config 是内核源码自带工具，路径：
-      #   /builder/kernel/scripts/config
-      # 无需安装任何额外软件包
-      # ================================================================
-      - name: Inject DAE and Docker kernel configs
+      - name: 🔧 注入 DAE + Docker 内核配置项
         id: injectconfig
         if: ${{ steps.loadconfig.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -193,12 +155,12 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║         注入 DAE (eBPF) 官方要求的内核配置项             ║"
-          echo "║  来源: github.com/daeuniverse/dae (官方 README)          ║"
+          echo "║    [1/3] 注入 DAE (eBPF) 官方要求 + SOCK_OPS 完整配置   ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
           # ---------------------------------------------------------------
-          # 以下配置项严格对应 DAE 官方文档要求，逐字不改
+          # DAE 官方文档列出的全部必须项
+          # 来源: github.com/daeuniverse/dae/blob/main/docs/en/README.md
           # ---------------------------------------------------------------
           $CFG --enable  CONFIG_BPF
           $CFG --enable  CONFIG_BPF_SYSCALL
@@ -207,21 +169,60 @@ jobs:
           $CFG --enable  CONFIG_KPROBES
           $CFG --enable  CONFIG_NET_INGRESS
           $CFG --enable  CONFIG_NET_EGRESS
-          $CFG --module  CONFIG_NET_SCH_INGRESS      # 官方要求 =m
-          $CFG --module  CONFIG_NET_CLS_BPF          # 官方要求 =m
+          $CFG --module  CONFIG_NET_SCH_INGRESS
+          $CFG --module  CONFIG_NET_CLS_BPF
           $CFG --enable  CONFIG_NET_CLS_ACT
           $CFG --enable  CONFIG_BPF_STREAM_PARSER
           $CFG --enable  CONFIG_DEBUG_INFO
-          $CFG --disable CONFIG_DEBUG_INFO_REDUCED   # 官方要求 is not set
-          $CFG --enable  CONFIG_DEBUG_INFO_BTF       # CO-RE 支持，最关键
+          $CFG --disable CONFIG_DEBUG_INFO_REDUCED
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF
           $CFG --enable  CONFIG_KPROBE_EVENTS
           $CFG --enable  CONFIG_BPF_EVENTS
-          $CFG --enable  CONFIG_CGROUP_BPF           # 按进程/MAC 分流必须
+          $CFG --enable  CONFIG_CGROUP_BPF
+
+          # ---------------------------------------------------------------
+          # ★ SOCK_OPS / CGROUP_SOCKADDR 完整支持
+          #   修复 daed 崩溃: "program of this type cannot use helper
+          #   bpf_get_current_task#35"
+          #   根因: local_tcp_sockops 需要以下全部配置
+          # ---------------------------------------------------------------
+          $CFG --enable  CONFIG_CGROUP_NET_CLASSID
+          $CFG --enable  CONFIG_CGROUP_NET_PRIO
+          $CFG --enable  CONFIG_SOCK_CGROUP_DATA
+
+          # BPF 附加到 socket/cgroup 的各类钩子
+          $CFG --enable  CONFIG_BPF_LSM
+          $CFG --enable  CONFIG_BPF_JIT_ALWAYS_ON
+
+          # ---------------------------------------------------------------
+          # ★ XDP + TC 高级功能（dae 性能优化依赖）
+          # ---------------------------------------------------------------
+          $CFG --enable  CONFIG_XDP_SOCKETS
+          $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
+
+          # ---------------------------------------------------------------
+          # ★ Tracing / kprobe 增强（dae 进程追踪依赖）
+          # ---------------------------------------------------------------
+          $CFG --enable  CONFIG_TRACEPOINTS
+          $CFG --enable  CONFIG_FTRACE
+          $CFG --enable  CONFIG_UPROBE_EVENTS
+          $CFG --enable  CONFIG_DYNAMIC_FTRACE
+
+          # ---------------------------------------------------------------
+          # ★ BTF 增强（确保 CO-RE 在所有模块生效）
+          # ---------------------------------------------------------------
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF_MODULES
+          $CFG --enable  CONFIG_MODULE_ALLOW_BTF_MISMATCH
+
+          # ---------------------------------------------------------------
+          # ★ ikconfig（让 dae 在运行时自检内核配置）
+          # ---------------------------------------------------------------
+          $CFG --enable  CONFIG_IKCONFIG
+          $CFG --enable  CONFIG_IKCONFIG_PROC
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║     注入 Docker 官方要求的内核配置项                     ║"
-          echo "║  来源: github.com/docker/docker/contrib/check-config.sh  ║"
+          echo "║    [2/3] 注入 Docker 官方要求的内核配置项                ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
           # 命名空间（容器隔离核心）
@@ -247,8 +248,6 @@ jobs:
           $CFG --enable  CONFIG_CGROUP_HUGETLB
           $CFG --enable  CONFIG_CFS_BANDWIDTH
           $CFG --enable  CONFIG_FAIR_GROUP_SCHED
-          $CFG --enable  CONFIG_NET_CLS_CGROUP
-          $CFG --enable  CONFIG_CGROUP_NET_PRIO
 
           # 网络虚拟化
           $CFG --module  CONFIG_VETH
@@ -277,7 +276,7 @@ jobs:
           $CFG --enable  CONFIG_IP_VS_PROTO_UDP
           $CFG --enable  CONFIG_IP_VS_RR
 
-          # Overlay 文件系统（Docker 镜像层，必须）
+          # Overlay 文件系统（Docker 镜像层）
           $CFG --module  CONFIG_OVERLAY_FS
 
           # 其他必须项
@@ -293,12 +292,13 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║   运行 make olddefconfig 自动解决全部配置依赖关系        ║"
+          echo "║    [3/3] 运行 make olddefconfig 解决全部依赖关系         ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           make olddefconfig
 
           echo ""
           echo "════════════════ ✅ 关键配置项验证结果 ════════════════"
+
           echo "--- DAE 官方要求项 ---"
           for key in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
                      CONFIG_CGROUPS CONFIG_KPROBES CONFIG_NET_INGRESS \
@@ -314,6 +314,15 @@ jobs:
             || echo "  ✅ CONFIG_DEBUG_INFO_REDUCED=not set (正确)"
 
           echo ""
+          echo "--- ★ SOCK_OPS 相关（修复 daed 崩溃）---"
+          for key in CONFIG_BPF_STREAM_PARSER CONFIG_SOCK_CGROUP_DATA \
+                     CONFIG_CGROUP_NET_CLASSID CONFIG_CGROUP_NET_PRIO \
+                     CONFIG_BPF_JIT_ALWAYS_ON; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo ""
           echo "--- Docker 关键项 ---"
           for key in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS \
                      CONFIG_MEMCG CONFIG_OVERLAY_FS CONFIG_VETH \
@@ -322,15 +331,18 @@ jobs:
             result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
             echo "  ${key}: ${result##*=}"
           done
-          echo "════════════════════════════════════════════════════"
 
+          echo ""
+          echo "--- 内核自检支持 ---"
+          for key in CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo "════════════════════════════════════════════════════"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      # ================================================================
-      # ★ 步骤 7：编译内核
-      # .config 已由上一步完整准备好，直接编译即可
-      # ================================================================
-      - name: Compile kernel
+      - name: 🔨 编译内核（Image.gz + DTB）
         id: compile
         if: ${{ steps.injectconfig.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -346,7 +358,7 @@ jobs:
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Build deb packages
+      - name: 📦 打包 deb 安装包
         id: debpkg
         if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -359,7 +371,7 @@ jobs:
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Collect and package artifacts
+      - name: 📋 收集编译产物并打包
         id: package
         if: ${{ steps.debpkg.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -391,7 +403,7 @@ jobs:
           echo "package_name=${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Upload Kernel to Release
+      - name: 🚀 上传内核到 Release
         uses: ophub/upload-to-releases@main
         if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
         with:
@@ -403,6 +415,4 @@ jobs:
           make_latest: false
           gh_token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            These are Mainline LTS(Long Term Support) kernels that provide stable support for Armbian and OpenWrt.
-            这些是主线 LTS（长期支持）内核，为 Armbian 和 OpenWrt 提供稳定的支持。
-            支持特性: DAE (eBPF 透明代理) + Docker 容器化
+            MSM8916 主线 LTS 内核（支持 DAE + Docker）
