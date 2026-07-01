@@ -1,11 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-
-# ================================================================
-# PKGS_DIR 必须与 rebuild-armbian.yml 中复制文件的目标路径一致
-# YAML 中: cp common-file/. → ${TEMP_DIR}/tmp/local_packages/
-# 所以 chroot 内的路径是 /tmp/local_packages/
-# ================================================================
 readonly PKGS_DIR="/tmp/local_packages"
 readonly LOG_FILE="/tmp/chroot-build.log"
 
@@ -14,13 +8,6 @@ log_ok()   { echo "✅ $*"; echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] $*" >> "${LO
 log_warn() { echo "⚠️  $*"; echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] $*" >> "${LOG_FILE}"; }
 log_err()  { echo "❌ $*" >&2; echo "$(date '+%Y-%m-%d %H:%M:%S') [ERROR] $*" >> "${LOG_FILE}"; }
 
-# ================================================================
-# ★ 修复 resolv.conf 符号链接问题（Bookworm 核心 Bug）
-#   原理：Debian Bookworm 中 /etc/resolv.conf 是指向
-#   /run/systemd/resolve/stub-resolv.conf 的符号链接
-#   在 chroot 中 /run 未挂载，该目标不存在
-#   必须提前创建目录和目标文件，再删除损坏的符号链接
-# ================================================================
 setup_dns() {
     log_info "配置 DNS（修复 Bookworm 符号链接问题）..."
 
@@ -43,8 +30,6 @@ setup_dns() {
 check_network() {
     log_info "检查 chroot 网络环境..."
 
-    # ★ 修复：进入 chroot 第一件事就先修复 resolv.conf
-    #   不能等到检测失败再修复，因为检测本身就需要 resolv.conf
     setup_dns
 
     if [[ -f /proc/net/dev ]]; then
@@ -218,12 +203,6 @@ common_set() {
         fi
     done
 
-    # ================================================================
-    # ★ 关键修复：启用 USB 网络服务（原脚本缺少此步骤！）
-    #   mobian-setup-usb-network.service 负责在设备启动时
-    #   配置 USB gadget RNDIS 模式并分配 IP 192.168.68.1
-    #   不 enable 则每次开机都不会自动运行，USB 网络永远无法使用
-    # ================================================================
     log_info "启用开机自启服务..."
 
     if [[ -f /usr/lib/systemd/system/mobian-setup-usb-network.service ]]; then
@@ -237,76 +216,6 @@ common_set() {
         systemctl enable btrfs-compress.service || log_warn "enable btrfs-compress 失败"
         log_ok "btrfs-compress.service 已启用"
     fi
-
-    # ================================================================
-    # ★ 设置 Armbian 默认 SSH 登录账号
-    #   Armbian 基础镜像首次启动强制修改密码会阻止 SSH 登录
-    #   预设密码 1234，与 OpenStick 社区惯例一致
-    # ================================================================
-    log_info "配置默认 root 密码（1234）..."
-    echo "root:1234" | chpasswd || log_warn "root 密码设置失败"
-
-    # 允许 root SSH 登录（嵌入式设备惯例）
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-        log_ok "SSH root 登录已启用"
-    fi
-
-    # ================================================================
-    # ★ 禁用 Armbian 首次登录强制改密码流程
-    #   否则 SSH 登录后会被强制要求改密码，自动化脚本无法使用
-    # ================================================================
-    rm -f /root/.not_logged_in_yet || true
-    # 禁用 armbian-firstlogin PAM 模块
-    sed -i '/armbian-firstlogin/d' /etc/pam.d/login 2>/dev/null || true
-    sed -i '/armbian-firstlogin/d' /etc/pam.d/sshd 2>/dev/null || true
-    log_ok "首次登录强制改密已禁用"
-
-    printf 'LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0\n' > /etc/fstab
-
-    if [[ -f /etc/rc.local ]]; then
-        log_info "修改 rc.local..."
-        sed -i '1s/ -e//' /etc/rc.local || true
-        python3 - << 'PYEOF'
-try:
-    with open('/etc/rc.local', 'r') as f:
-        lines = f.readlines()
-    insert_line = 'mcli c u USB\n'
-    pos = min(12, len(lines))
-    if insert_line not in lines:
-        lines.insert(pos, insert_line)
-        with open('/etc/rc.local', 'w') as f:
-            f.writelines(lines)
-        print('✅ mcli 命令已插入 rc.local')
-    else:
-        print('✅ mcli 命令已存在，跳过')
-except Exception as e:
-    print(f'⚠️  rc.local 处理异常（非致命）: {e}')
-PYEOF
-    fi
-
-    [[ -f /usr/lib/systemd/system/rc-local.service ]] && \
-        sed -i 's/forking/idle/g' /usr/lib/systemd/system/rc-local.service || true
-
-    if [[ -f /etc/armbian-release ]]; then
-        sed -i 's/BOARD=odroidn2/BOARD=msm8916/g' /etc/armbian-release || true
-        sed -i 's/BOARD_NAME="Odroid N2"/BOARD_NAME="MSM8916"/g' /etc/armbian-release || true
-    fi
-
-    [[ -f /etc/default/armbian-zram-config ]] && {
-        sed -i 's/# ZRAM_PERCENTAGE=50/ZRAM_PERCENTAGE=300/g' /etc/default/armbian-zram-config || true
-        sed -i 's/# MEM_LIMIT_PERCENTAGE=50/MEM_LIMIT_PERCENTAGE=300/g' /etc/default/armbian-zram-config || true
-    }
-
-    [[ -f /usr/sbin/openstick-sim-changer.sh ]] && \
-        sed -i '21s/$sim/sim:sel/' /usr/sbin/openstick-sim-changer.sh || true
-
-    rm -f /etc/localtime || true
-    ln -sf /usr/share/zoneinfo/Asia/Chongqing /etc/localtime || true
-
-    log_ok "系统配置完成"
-}
 
 clean_file() {
     log_info "清理 /boot..."
