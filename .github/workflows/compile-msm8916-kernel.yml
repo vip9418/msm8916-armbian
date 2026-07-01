@@ -155,16 +155,15 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║    [1/3] 注入 DAE (eBPF) 官方要求 + SOCK_OPS 完整配置   ║"
+          echo "║  [1/3] DAE 官方必须项 + SOCK_OPS 完整支持               ║"
+          echo "║  来源: github.com/daeuniverse/dae 官方 README            ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
-          # ---------------------------------------------------------------
-          # DAE 官方文档列出的全部必须项
-          # 来源: github.com/daeuniverse/dae/blob/main/docs/en/README.md
-          # ---------------------------------------------------------------
+          # ── DAE 官方文档全部必须项（逐字对应）──
           $CFG --enable  CONFIG_BPF
           $CFG --enable  CONFIG_BPF_SYSCALL
           $CFG --enable  CONFIG_BPF_JIT
+          $CFG --enable  CONFIG_BPF_JIT_ALWAYS_ON
           $CFG --enable  CONFIG_CGROUPS
           $CFG --enable  CONFIG_KPROBES
           $CFG --enable  CONFIG_NET_INGRESS
@@ -180,52 +179,42 @@ jobs:
           $CFG --enable  CONFIG_BPF_EVENTS
           $CFG --enable  CONFIG_CGROUP_BPF
 
-          # ---------------------------------------------------------------
-          # ★ SOCK_OPS / CGROUP_SOCKADDR 完整支持
-          #   修复 daed 崩溃: "program of this type cannot use helper
-          #   bpf_get_current_task#35"
-          #   根因: local_tcp_sockops 需要以下全部配置
-          # ---------------------------------------------------------------
+          # ── SOCK_OPS 完整支持（修复 daed bpf_get_current_task 崩溃）──
+          # 这是 local_tcp_sockops 程序的必须依赖
+          $CFG --enable  CONFIG_SOCK_CGROUP_DATA
           $CFG --enable  CONFIG_CGROUP_NET_CLASSID
           $CFG --enable  CONFIG_CGROUP_NET_PRIO
-          $CFG --enable  CONFIG_SOCK_CGROUP_DATA
 
-          # BPF 附加到 socket/cgroup 的各类钩子
-          $CFG --enable  CONFIG_BPF_LSM
-          $CFG --enable  CONFIG_BPF_JIT_ALWAYS_ON
-
-          # ---------------------------------------------------------------
-          # ★ XDP + TC 高级功能（dae 性能优化依赖）
-          # ---------------------------------------------------------------
-          $CFG --enable  CONFIG_XDP_SOCKETS
-          $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
-
-          # ---------------------------------------------------------------
-          # ★ Tracing / kprobe 增强（dae 进程追踪依赖）
-          # ---------------------------------------------------------------
-          $CFG --enable  CONFIG_TRACEPOINTS
-          $CFG --enable  CONFIG_FTRACE
-          $CFG --enable  CONFIG_UPROBE_EVENTS
-          $CFG --enable  CONFIG_DYNAMIC_FTRACE
-
-          # ---------------------------------------------------------------
-          # ★ BTF 增强（确保 CO-RE 在所有模块生效）
-          # ---------------------------------------------------------------
+          # ── BTF 增强（CO-RE 可移植性）──
           $CFG --enable  CONFIG_DEBUG_INFO_BTF_MODULES
-          $CFG --enable  CONFIG_MODULE_ALLOW_BTF_MISMATCH
 
-          # ---------------------------------------------------------------
-          # ★ ikconfig（让 dae 在运行时自检内核配置）
-          # ---------------------------------------------------------------
+          # ── ikconfig（运行时读取 /proc/config.gz）──
           $CFG --enable  CONFIG_IKCONFIG
           $CFG --enable  CONFIG_IKCONFIG_PROC
 
+          # ── XDP 支持（dae 高性能数据路径）──
+          $CFG --enable  CONFIG_XDP_SOCKETS
+          $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
+
+          # ── Tracing（dae 进程追踪，仅静态部分，不含动态修改）──
+          $CFG --enable  CONFIG_TRACEPOINTS
+          $CFG --enable  CONFIG_KPROBE_EVENTS
+          $CFG --enable  CONFIG_UPROBE_EVENTS
+          # ★ 不启用 CONFIG_FTRACE / CONFIG_DYNAMIC_FTRACE
+          #   原因：DYNAMIC_FTRACE 在 MSM8916 bootloader 上会导致变砖
+          #   DAE 不需要 ftrace，kprobe/uprobe 已足够
+
+          # ★ 不启用 CONFIG_BPF_LSM
+          #   原因：需要 bootloader 传递 lsm=bpf 参数
+          #   MSM8916 bootloader 不支持此参数，会导致 Kernel Panic
+
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║    [2/3] 注入 Docker 官方要求的内核配置项                ║"
+          echo "║  [2/3] Docker 官方必须项                                 ║"
+          echo "║  来源: github.com/docker/docker/contrib/check-config.sh  ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
-          # 命名空间（容器隔离核心）
+          # 命名空间
           $CFG --enable  CONFIG_NAMESPACES
           $CFG --enable  CONFIG_NET_NS
           $CFG --enable  CONFIG_PID_NS
@@ -233,7 +222,7 @@ jobs:
           $CFG --enable  CONFIG_UTS_NS
           $CFG --enable  CONFIG_USER_NS
 
-          # Cgroup（资源限制）
+          # Cgroup
           $CFG --enable  CONFIG_CGROUP_CPUACCT
           $CFG --enable  CONFIG_CGROUP_DEVICE
           $CFG --enable  CONFIG_CGROUP_FREEZER
@@ -255,7 +244,7 @@ jobs:
           $CFG --enable  CONFIG_BRIDGE_NETFILTER
           $CFG --enable  CONFIG_DUMMY
 
-          # Netfilter / iptables
+          # Netfilter
           $CFG --enable  CONFIG_NETFILTER
           $CFG --enable  CONFIG_NF_CONNTRACK
           $CFG --module  CONFIG_NF_NAT
@@ -276,51 +265,60 @@ jobs:
           $CFG --enable  CONFIG_IP_VS_PROTO_UDP
           $CFG --enable  CONFIG_IP_VS_RR
 
-          # Overlay 文件系统（Docker 镜像层）
+          # Overlay FS
           $CFG --module  CONFIG_OVERLAY_FS
 
-          # 其他必须项
+          # 其他
           $CFG --enable  CONFIG_POSIX_MQUEUE
           $CFG --module  CONFIG_TUN
           $CFG --enable  CONFIG_SECCOMP
           $CFG --enable  CONFIG_SECCOMP_FILTER
-
-          # 存储驱动
           $CFG --enable  CONFIG_EXT4_FS
           $CFG --enable  CONFIG_EXT4_FS_POSIX_ACL
           $CFG --enable  CONFIG_EXT4_FS_SECURITY
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║    [3/3] 运行 make olddefconfig 解决全部依赖关系         ║"
+          echo "║  [3/3] make olddefconfig 解决依赖关系                    ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           make olddefconfig
 
           echo ""
-          echo "════════════════ ✅ 关键配置项验证结果 ════════════════"
+          echo "════════════════ ✅ 关键配置验证 ════════════════"
 
-          echo "--- DAE 官方要求项 ---"
+          echo "--- DAE 必须项 ---"
           for key in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
-                     CONFIG_CGROUPS CONFIG_KPROBES CONFIG_NET_INGRESS \
-                     CONFIG_NET_EGRESS CONFIG_NET_SCH_INGRESS CONFIG_NET_CLS_BPF \
-                     CONFIG_NET_CLS_ACT CONFIG_BPF_STREAM_PARSER CONFIG_DEBUG_INFO \
-                     CONFIG_DEBUG_INFO_BTF CONFIG_KPROBE_EVENTS CONFIG_BPF_EVENTS \
-                     CONFIG_CGROUP_BPF; do
-            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+                     CONFIG_BPF_JIT_ALWAYS_ON CONFIG_CGROUPS CONFIG_KPROBES \
+                     CONFIG_NET_INGRESS CONFIG_NET_EGRESS \
+                     CONFIG_NET_SCH_INGRESS CONFIG_NET_CLS_BPF \
+                     CONFIG_NET_CLS_ACT CONFIG_BPF_STREAM_PARSER \
+                     CONFIG_DEBUG_INFO CONFIG_DEBUG_INFO_BTF \
+                     CONFIG_KPROBE_EVENTS CONFIG_BPF_EVENTS CONFIG_CGROUP_BPF; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
             echo "  ${key}: ${result##*=}"
           done
+
           grep "CONFIG_DEBUG_INFO_REDUCED" .config \
-            && echo "  ⚠️  WARNING: CONFIG_DEBUG_INFO_REDUCED 仍存在！" \
+            && echo "  ⚠️  CONFIG_DEBUG_INFO_REDUCED 存在！" \
             || echo "  ✅ CONFIG_DEBUG_INFO_REDUCED=not set (正确)"
 
           echo ""
-          echo "--- ★ SOCK_OPS 相关（修复 daed 崩溃）---"
+          echo "--- SOCK_OPS（daed 崩溃修复）---"
           for key in CONFIG_BPF_STREAM_PARSER CONFIG_SOCK_CGROUP_DATA \
                      CONFIG_CGROUP_NET_CLASSID CONFIG_CGROUP_NET_PRIO \
                      CONFIG_BPF_JIT_ALWAYS_ON; do
-            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
             echo "  ${key}: ${result##*=}"
           done
+
+          echo ""
+          echo "--- 安全排除项（防止变砖）---"
+          grep "^CONFIG_BPF_LSM=" .config \
+            && echo "  ⚠️  CONFIG_BPF_LSM 仍存在，可能导致变砖！" \
+            || echo "  ✅ CONFIG_BPF_LSM 未启用（安全）"
+          grep "^CONFIG_DYNAMIC_FTRACE=" .config \
+            && echo "  ⚠️  CONFIG_DYNAMIC_FTRACE 仍存在，可能导致变砖！" \
+            || echo "  ✅ CONFIG_DYNAMIC_FTRACE 未启用（安全）"
 
           echo ""
           echo "--- Docker 关键项 ---"
@@ -328,18 +326,18 @@ jobs:
                      CONFIG_MEMCG CONFIG_OVERLAY_FS CONFIG_VETH \
                      CONFIG_BRIDGE CONFIG_NF_NAT CONFIG_SECCOMP \
                      CONFIG_CGROUP_FREEZER CONFIG_KEYS; do
-            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
             echo "  ${key}: ${result##*=}"
           done
 
           echo ""
-          echo "--- 内核自检支持 ---"
+          echo "--- ikconfig ---"
           for key in CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
-            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
             echo "  ${key}: ${result##*=}"
           done
 
-          echo "════════════════════════════════════════════════════"
+          echo "════════════════════════════════════════════════"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 🔨 编译内核（Image.gz + DTB）
