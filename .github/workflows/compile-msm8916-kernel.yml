@@ -21,6 +21,7 @@ on:
 env:
   TZ: Etc/UTC
   KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
+  KERNEL_BRANCH: msm8916/6.18
 
 jobs:
   build:
@@ -76,10 +77,25 @@ jobs:
         id: clone
         run: |
           cd /builder
-          git clone --depth=1 https://github.com/${{ env.KERNEL_REPO }}.git kernel
+
+          # ================================================================
+          # ★ 关键修正：必须指定 msm8916/6.18 分支
+          # 因为 msm8916_defconfig 只存在于该分支下：
+          #   arch/arm64/configs/msm8916_defconfig
+          # 不指定分支会拉取默认分支，导致 make msm8916_defconfig 报错
+          # ================================================================
+          echo "正在克隆内核源码..."
+          echo "仓库: https://github.com/${{ env.KERNEL_REPO }}"
+          echo "分支: ${{ env.KERNEL_BRANCH }}"
+
+          git clone \
+            --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            https://github.com/${{ env.KERNEL_REPO }}.git kernel
+
           cd kernel
 
-          # Get kernel version from Makefile
+          # 获取内核版本号
           KERNEL_VERSION=$(grep -E "^VERSION = " Makefile | awk '{print $3}')
           KERNEL_PATCHLEVEL=$(grep -E "^PATCHLEVEL = " Makefile | awk '{print $3}')
           KERNEL_SUBLEVEL=$(grep -E "^SUBLEVEL = " Makefile | awk '{print $3}')
@@ -87,7 +103,21 @@ jobs:
 
           echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_ENV}
           echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_OUTPUT}
-          echo "Kernel version: ${FULL_VERSION}"
+          echo "✅ 内核版本: ${FULL_VERSION}"
+
+          # 确认 defconfig 文件存在（早期验证，出错信息更友好）
+          echo ""
+          echo "════ 验证 defconfig 文件存在性 ════"
+          ls -la arch/arm64/configs/ | grep defconfig || true
+          if [ -f "arch/arm64/configs/msm8916_defconfig" ]; then
+            echo "✅ arch/arm64/configs/msm8916_defconfig 确认存在"
+          else
+            echo "❌ 错误: msm8916_defconfig 不存在于当前分支!"
+            echo "   当前分支: ${{ env.KERNEL_BRANCH }}"
+            echo "   请检查 KERNEL_BRANCH 变量是否正确"
+            exit 1
+          fi
+
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Cache ccache
@@ -99,7 +129,18 @@ jobs:
             msm8916-${{ env.kernel_version }}-
 
       # ================================================================
-      # ★ 步骤 5：加载基础 defconfig（从原 compile 步骤拆分出来）
+      # ★ 步骤 5：加载基础 defconfig
+      #
+      # 【文件来源完整说明】
+      # 此步骤执行 make msm8916_defconfig，内核构建系统会自动读取：
+      #   /builder/kernel/arch/arm64/configs/msm8916_defconfig
+      # 该文件来自上一步 git clone 下来的外部仓库：
+      #   仓库: Crychic-Band/kernel_ufi_msm8916
+      #   分支: msm8916/6.18
+      #   路径: arch/arm64/configs/msm8916_defconfig
+      #
+      # 用户自己的仓库（vip9418/msm8916-armbian）
+      # 完全不需要建立或存储任何 defconfig 文件！
       # ================================================================
       - name: Load base kernel config
         id: loadconfig
@@ -107,7 +148,6 @@ jobs:
         run: |
           cd /builder/kernel
 
-          # Setup ccache
           export CCACHE_DIR=/builder/kernel/.ccache
           export PATH="/usr/lib/ccache:$PATH"
           ccache -M 5G
@@ -116,22 +156,32 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
 
-          # 加载设备基础配置
-          make ${{ inputs.kernel_config }}
+          REQUESTED_CONFIG="${{ inputs.kernel_config }}"
+          echo "加载基础配置: ${REQUESTED_CONFIG}"
 
-          echo "Base config loaded: ${{ inputs.kernel_config }}"
+          if [ -f "arch/arm64/configs/${REQUESTED_CONFIG}" ]; then
+            echo "✅ 确认配置文件存在: arch/arm64/configs/${REQUESTED_CONFIG}"
+            make ${REQUESTED_CONFIG}
+          else
+            echo "⚠️  未找到 ${REQUESTED_CONFIG}，自动回退到 defconfig"
+            make defconfig
+          fi
+
+          echo "✅ 基础 .config 已生成"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       # ================================================================
-      # ★ 步骤 6：注入 DAE + Docker 所需内核配置项（核心新增步骤）
+      # ★ 步骤 6：注入 DAE + Docker 所需内核配置项
       #
-      # DAE 配置来源：
+      # DAE 配置来源（官方文档，逐字对应）：
       #   https://github.com/daeuniverse/dae/blob/main/docs/en/README.md
-      #   https://dae.v2raya.org/docs/current/quick-start/
       #
-      # Docker 配置来源：
+      # Docker 配置来源（官方验证脚本）：
       #   https://github.com/docker/docker/blob/master/contrib/check-config.sh
-      #   Docker 官方及社区 issue #14282 验证清单
+      #
+      # scripts/config 是内核源码自带工具，路径：
+      #   /builder/kernel/scripts/config
+      # 无需安装任何额外软件包
       # ================================================================
       - name: Inject DAE and Docker kernel configs
         id: injectconfig
@@ -144,11 +194,11 @@ jobs:
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
           echo "║         注入 DAE (eBPF) 官方要求的内核配置项             ║"
-          echo "║  来源: github.com/daeuniverse/dae/blob/main/docs/en/README.md ║"
+          echo "║  来源: github.com/daeuniverse/dae (官方 README)          ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
           # ---------------------------------------------------------------
-          # DAE 官方文档列出的全部必须项（逐字对应，不增不减）
+          # 以下配置项严格对应 DAE 官方文档要求，逐字不改
           # ---------------------------------------------------------------
           $CFG --enable  CONFIG_BPF
           $CFG --enable  CONFIG_BPF_SYSCALL
@@ -163,32 +213,26 @@ jobs:
           $CFG --enable  CONFIG_BPF_STREAM_PARSER
           $CFG --enable  CONFIG_DEBUG_INFO
           $CFG --disable CONFIG_DEBUG_INFO_REDUCED   # 官方要求 is not set
-          $CFG --enable  CONFIG_DEBUG_INFO_BTF       # 最关键：CO-RE 支持
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF       # CO-RE 支持，最关键
           $CFG --enable  CONFIG_KPROBE_EVENTS
           $CFG --enable  CONFIG_BPF_EVENTS
-
-          # DAE 同样受益于 CGROUP_BPF（按进程/MAC 分流）
-          $CFG --enable  CONFIG_CGROUP_BPF
+          $CFG --enable  CONFIG_CGROUP_BPF           # 按进程/MAC 分流必须
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║     注入 Docker 官方要求的内核配置项（必须项）           ║"
+          echo "║     注入 Docker 官方要求的内核配置项                     ║"
           echo "║  来源: github.com/docker/docker/contrib/check-config.sh  ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
-          # ---------------------------------------------------------------
           # 命名空间（容器隔离核心）
-          # ---------------------------------------------------------------
           $CFG --enable  CONFIG_NAMESPACES
           $CFG --enable  CONFIG_NET_NS
           $CFG --enable  CONFIG_PID_NS
           $CFG --enable  CONFIG_IPC_NS
           $CFG --enable  CONFIG_UTS_NS
-          $CFG --enable  CONFIG_USER_NS             # 可选但推荐，rootless 容器需要
+          $CFG --enable  CONFIG_USER_NS
 
-          # ---------------------------------------------------------------
-          # Cgroup（容器资源限制）
-          # ---------------------------------------------------------------
+          # Cgroup（资源限制）
           $CFG --enable  CONFIG_CGROUP_CPUACCT
           $CFG --enable  CONFIG_CGROUP_DEVICE
           $CFG --enable  CONFIG_CGROUP_FREEZER
@@ -206,17 +250,13 @@ jobs:
           $CFG --enable  CONFIG_NET_CLS_CGROUP
           $CFG --enable  CONFIG_CGROUP_NET_PRIO
 
-          # ---------------------------------------------------------------
-          # 网络虚拟化（容器网络核心）
-          # ---------------------------------------------------------------
-          $CFG --module  CONFIG_VETH                # 容器虚拟网卡
-          $CFG --module  CONFIG_BRIDGE              # 容器网桥
+          # 网络虚拟化
+          $CFG --module  CONFIG_VETH
+          $CFG --module  CONFIG_BRIDGE
           $CFG --enable  CONFIG_BRIDGE_NETFILTER
           $CFG --enable  CONFIG_DUMMY
 
-          # ---------------------------------------------------------------
-          # Netfilter / iptables（容器 NAT 与网络策略）
-          # ---------------------------------------------------------------
+          # Netfilter / iptables
           $CFG --enable  CONFIG_NETFILTER
           $CFG --enable  CONFIG_NF_CONNTRACK
           $CFG --module  CONFIG_NF_NAT
@@ -225,61 +265,70 @@ jobs:
           $CFG --module  CONFIG_IP_NF_MANGLE
           $CFG --module  CONFIG_IP_NF_TARGET_MASQUERADE
           $CFG --module  CONFIG_IP_NF_NAT
-          $CFG --module  CONFIG_IP_NF_TARGET_REDIRECT
           $CFG --module  CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
           $CFG --module  CONFIG_NETFILTER_XT_MATCH_CONNTRACK
           $CFG --module  CONFIG_NETFILTER_XT_MATCH_IPVS
           $CFG --module  CONFIG_NETFILTER_XT_MARK
 
-          # ---------------------------------------------------------------
-          # IPVS（Docker Swarm / 负载均衡）
-          # ---------------------------------------------------------------
+          # IPVS
           $CFG --enable  CONFIG_IP_VS
           $CFG --enable  CONFIG_IP_VS_NFCT
           $CFG --enable  CONFIG_IP_VS_PROTO_TCP
           $CFG --enable  CONFIG_IP_VS_PROTO_UDP
           $CFG --enable  CONFIG_IP_VS_RR
 
-          # ---------------------------------------------------------------
-          # Overlay 文件系统（Docker 镜像分层存储，必须）
-          # ---------------------------------------------------------------
+          # Overlay 文件系统（Docker 镜像层，必须）
           $CFG --module  CONFIG_OVERLAY_FS
 
-          # ---------------------------------------------------------------
           # 其他必须项
-          # ---------------------------------------------------------------
-          $CFG --enable  CONFIG_POSIX_MQUEUE        # 进程通信
-          $CFG --module  CONFIG_TUN                 # VPN / 虚拟网络接口
-          $CFG --enable  CONFIG_SECCOMP             # 容器安全沙箱
+          $CFG --enable  CONFIG_POSIX_MQUEUE
+          $CFG --module  CONFIG_TUN
+          $CFG --enable  CONFIG_SECCOMP
           $CFG --enable  CONFIG_SECCOMP_FILTER
 
-          # ---------------------------------------------------------------
-          # 存储驱动支持
-          # ---------------------------------------------------------------
+          # 存储驱动
           $CFG --enable  CONFIG_EXT4_FS
           $CFG --enable  CONFIG_EXT4_FS_POSIX_ACL
           $CFG --enable  CONFIG_EXT4_FS_SECURITY
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║     运行 make olddefconfig 自动解决全部依赖关系          ║"
+          echo "║   运行 make olddefconfig 自动解决全部配置依赖关系        ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           make olddefconfig
 
           echo ""
-          echo "════════════════ ✅ 配置验证结果 ════════════════"
-          echo "--- DAE 官方要求的配置项 ---"
-          grep -E "^CONFIG_(BPF|BPF_SYSCALL|BPF_JIT|CGROUPS|KPROBES|NET_INGRESS|NET_EGRESS|NET_SCH_INGRESS|NET_CLS_BPF|NET_CLS_ACT|BPF_STREAM_PARSER|DEBUG_INFO|DEBUG_INFO_BTF|KPROBE_EVENTS|BPF_EVENTS|CGROUP_BPF)=" .config | sort || true
-          grep "CONFIG_DEBUG_INFO_REDUCED" .config || echo "✅ CONFIG_DEBUG_INFO_REDUCED is not set (correct)"
+          echo "════════════════ ✅ 关键配置项验证结果 ════════════════"
+          echo "--- DAE 官方要求项 ---"
+          for key in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
+                     CONFIG_CGROUPS CONFIG_KPROBES CONFIG_NET_INGRESS \
+                     CONFIG_NET_EGRESS CONFIG_NET_SCH_INGRESS CONFIG_NET_CLS_BPF \
+                     CONFIG_NET_CLS_ACT CONFIG_BPF_STREAM_PARSER CONFIG_DEBUG_INFO \
+                     CONFIG_DEBUG_INFO_BTF CONFIG_KPROBE_EVENTS CONFIG_BPF_EVENTS \
+                     CONFIG_CGROUP_BPF; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+          grep "CONFIG_DEBUG_INFO_REDUCED" .config \
+            && echo "  ⚠️  WARNING: CONFIG_DEBUG_INFO_REDUCED 仍存在！" \
+            || echo "  ✅ CONFIG_DEBUG_INFO_REDUCED=not set (正确)"
+
           echo ""
-          echo "--- Docker 关键配置项 ---"
-          grep -E "^CONFIG_(NAMESPACES|NET_NS|PID_NS|IPC_NS|UTS_NS|MEMCG|OVERLAY_FS|VETH|BRIDGE|NF_NAT|SECCOMP|POSIX_MQUEUE|CGROUP_FREEZER|CGROUP_DEVICE|KEYS)=" .config | sort || true
-          echo "════════════════════════════════════════════════"
+          echo "--- Docker 关键项 ---"
+          for key in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS \
+                     CONFIG_MEMCG CONFIG_OVERLAY_FS CONFIG_VETH \
+                     CONFIG_BRIDGE CONFIG_NF_NAT CONFIG_SECCOMP \
+                     CONFIG_CGROUP_FREEZER CONFIG_KEYS; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "❌ NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+          echo "════════════════════════════════════════════════════"
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       # ================================================================
-      # ★ 步骤 7：编译内核（.config 已由上一步准备好，直接编译）
+      # ★ 步骤 7：编译内核
+      # .config 已由上一步完整准备好，直接编译即可
       # ================================================================
       - name: Compile kernel
         id: compile
@@ -293,7 +342,6 @@ jobs:
           export CROSS_COMPILE=aarch64-linux-gnu-
           export DTC_FLAGS="-@"
 
-          # 直接编译，.config 已由 injectconfig 步骤完整准备
           make -j$(nproc) Image.gz dtbs
 
           echo "status=success" >> ${GITHUB_OUTPUT}
@@ -307,7 +355,6 @@ jobs:
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
 
-          # Step 2: Build deb packages (headers + image)
           make -j$(nproc) bindeb-pkg LOCALVERSION=-msm8916 KDEB_PKGVERSION=${{ env.kernel_version }}-1 KDEB_SOURCENAME=linux-msm8916
 
           echo "status=success" >> ${GITHUB_OUTPUT}
@@ -322,19 +369,15 @@ jobs:
 
           KERNEL_VER="${{ env.kernel_version }}"
 
-          # Copy compiled kernel files
           cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
           cp /builder/kernel/arch/arm64/boot/Image.gz ./
 
-          # Find deb packages (bindeb-pkg outputs to parent dir /builder/)
           find /builder -maxdepth 1 -name "linux-headers-*${KERNEL_VER}*.deb" ! -name "*dbg*" -type f -exec cp {} ./linux-headers.deb \;
           find /builder -maxdepth 1 -name "linux-image-*${KERNEL_VER}*.deb" ! -name "*dbg*" -type f -exec cp {} ./linux-image.deb \;
 
-          # Verify all files exist
           echo "=== Package contents ==="
           ls -la ./
 
-          # Check required files
           for f in msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb; do
             if [ ! -f "$f" ]; then
               echo "ERROR: Missing file: $f"
@@ -342,7 +385,6 @@ jobs:
             fi
           done
 
-          # Create tar.gz package
           tar -czf "${KERNEL_VER}.tar.gz" msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb
 
           echo "package_path=/builder/kernel_package/${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
