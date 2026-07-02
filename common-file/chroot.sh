@@ -273,23 +273,6 @@ common_set() {
         enable_service "btrfs-compress.service" "btrfs-compress.service 已启用"
     fi
 
-    # ── SSH 配置：允许 root 登录，禁用强制改密 ──
-    log_info "配置 SSH root 登录..."
-    if [[ -f /etc/ssh/sshd_config ]]; then
-        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-        log_ok "SSH root 登录已启用"
-    fi
-
-    log_info "设置 root 默认密码（1234）..."
-    echo "root:1234" | chpasswd || log_warn "root 密码设置失败"
-
-    log_info "禁用 Armbian 首次登录强制改密..."
-    rm -f /root/.not_logged_in_yet || true
-    sed -i '/armbian-firstlogin/d' /etc/pam.d/login 2>/dev/null || true
-    sed -i '/armbian-firstlogin/d' /etc/pam.d/sshd 2>/dev/null || true
-    log_ok "首次登录强制改密已禁用"
-
     # ── 时区 ──
     log_info "设置时区为 Asia/Shanghai..."
     rm -f /etc/localtime || true
@@ -444,8 +427,6 @@ main() {
 
     log_ok "chroot 构建全部完成！"
     log_info "════════════════════════════════════"
-    log_info "首次登录: ssh root@192.168.68.1"
-    log_info "默认密码: 1234"
     log_info "时区: Asia/Shanghai (UTC+8)"
     log_info "BBR: 重启后自动生效"
     log_info "════════════════════════════════════"
