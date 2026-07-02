@@ -19,7 +19,7 @@ on:
         type: boolean
 
 env:
-  TZ: Etc/UTC
+  TZ: Asia/Chongqing
   KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
   KERNEL_BRANCH: msm8916/6.18
 
@@ -196,6 +196,14 @@ jobs:
           $CFG --enable  CONFIG_XDP_SOCKETS
           $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
 
+          # ── BBR 拥塞控制算法 ──
+          echo ""
+          echo "── BBR 拥塞控制算法 ──"
+          $CFG --enable  CONFIG_TCP_CONG_ADVANCED
+          $CFG --module  CONFIG_TCP_CONG_BBR
+          $CFG --module  CONFIG_NET_SCH_FQ
+          $CFG --module  CONFIG_NET_SCH_FQ_CODEL
+
           # ── Tracing（dae 进程追踪，仅静态部分，不含动态修改）──
           $CFG --enable  CONFIG_TRACEPOINTS
           $CFG --enable  CONFIG_KPROBE_EVENTS
@@ -203,10 +211,6 @@ jobs:
           # ★ 不启用 CONFIG_FTRACE / CONFIG_DYNAMIC_FTRACE
           #   原因：DYNAMIC_FTRACE 在 MSM8916 bootloader 上会导致变砖
           #   DAE 不需要 ftrace，kprobe/uprobe 已足够
-
-          # ★ 不启用 CONFIG_BPF_LSM
-          #   原因：需要 bootloader 传递 lsm=bpf 参数
-          #   MSM8916 bootloader 不支持此参数，会导致 Kernel Panic
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
