@@ -274,10 +274,10 @@ common_set() {
     fi
 
     # ── 时区 ──
-    log_info "设置时区为 Asia/Shanghai..."
+    log_info "设置时区为 Asia/Chongqing..."
     rm -f /etc/localtime || true
-    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime || true
-    log_ok "时区已设置为 Asia/Shanghai"
+    ln -sf /usr/share/zoneinfo/Asia/Chongqing /etc/localtime || true
+    log_ok "时区已设置为 Asia/Chongqing"
 
     # ── fstab ──
     printf 'LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0\n' > /etc/fstab
@@ -427,7 +427,7 @@ main() {
 
     log_ok "chroot 构建全部完成！"
     log_info "════════════════════════════════════"
-    log_info "时区: Asia/Shanghai (UTC+8)"
+    log_info "时区: Asia/Chongqing (UTC+8)"
     log_info "BBR: 重启后自动生效"
     log_info "════════════════════════════════════"
 }
