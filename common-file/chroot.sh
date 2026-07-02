@@ -263,7 +263,8 @@ common_set() {
     log_info "启用开机自启服务..."
 
     if [[ -f /usr/lib/systemd/system/mobian-setup-usb-network.service ]]; then
-        enable_service "mobian-setup-usb-network.service" "mobian-setup-usb-network.service 已启用（USB RNDIS 网络）"
+        enable_service "mobian-setup-usb-network.service" \
+            "mobian-setup-usb-network.service 已启用（USB RNDIS 网络）"
     else
         log_warn "mobian-setup-usb-network.service 不存在，USB 网络将无法工作"
     fi
@@ -271,6 +272,130 @@ common_set() {
     if [[ -f /usr/lib/systemd/system/btrfs-compress.service ]]; then
         enable_service "btrfs-compress.service" "btrfs-compress.service 已启用"
     fi
+
+    # ── SSH 配置：允许 root 登录，禁用强制改密 ──
+    log_info "配置 SSH root 登录..."
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config || true
+        sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
+        log_ok "SSH root 登录已启用"
+    fi
+
+    log_info "设置 root 默认密码（1234）..."
+    echo "root:1234" | chpasswd || log_warn "root 密码设置失败"
+
+    log_info "禁用 Armbian 首次登录强制改密..."
+    rm -f /root/.not_logged_in_yet || true
+    sed -i '/armbian-firstlogin/d' /etc/pam.d/login 2>/dev/null || true
+    sed -i '/armbian-firstlogin/d' /etc/pam.d/sshd 2>/dev/null || true
+    log_ok "首次登录强制改密已禁用"
+
+    # ── 时区 ──
+    log_info "设置时区为 Asia/Shanghai..."
+    rm -f /etc/localtime || true
+    ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime || true
+    log_ok "时区已设置为 Asia/Shanghai"
+
+    # ── fstab ──
+    printf 'LABEL=aarch64 / btrfs defaults,noatime,compress=zstd,commit=30 0 0\n' > /etc/fstab
+
+    # ── rc.local ──
+    if [[ -f /etc/rc.local ]]; then
+        log_info "修改 rc.local..."
+        sed -i '1s/ -e//' /etc/rc.local || true
+        python3 - << 'PYEOF'
+try:
+    with open('/etc/rc.local', 'r') as f:
+        lines = f.readlines()
+    insert_line = 'mcli c u USB\n'
+    pos = min(12, len(lines))
+    if insert_line not in lines:
+        lines.insert(pos, insert_line)
+        with open('/etc/rc.local', 'w') as f:
+            f.writelines(lines)
+        print('✅ mcli 命令已插入 rc.local')
+    else:
+        print('✅ mcli 命令已存在，跳过')
+except Exception as e:
+    print(f'⚠️  rc.local 处理异常（非致命）: {e}')
+PYEOF
+    fi
+
+    [[ -f /usr/lib/systemd/system/rc-local.service ]] && \
+        sed -i 's/forking/idle/g' /usr/lib/systemd/system/rc-local.service || true
+
+    # ── Armbian 板级信息 ──
+    if [[ -f /etc/armbian-release ]]; then
+        sed -i 's/BOARD=odroidn2/BOARD=msm8916/g' /etc/armbian-release || true
+        sed -i 's/BOARD_NAME="Odroid N2"/BOARD_NAME="MSM8916"/g' /etc/armbian-release || true
+        log_ok "Armbian 板级信息已修改"
+    fi
+
+    # ── ZRAM ──
+    if [[ -f /etc/default/armbian-zram-config ]]; then
+        sed -i 's/# ZRAM_PERCENTAGE=50/ZRAM_PERCENTAGE=300/g' \
+            /etc/default/armbian-zram-config || true
+        sed -i 's/# MEM_LIMIT_PERCENTAGE=50/MEM_LIMIT_PERCENTAGE=300/g' \
+            /etc/default/armbian-zram-config || true
+        log_ok "ZRAM 配置已优化"
+    fi
+
+    # ── SIM 切换器 ──
+    if [[ -f /usr/sbin/openstick-sim-changer.sh ]]; then
+        sed -i '21s/$sim/sim:sel/' /usr/sbin/openstick-sim-changer.sh || true
+    fi
+
+    log_ok "系统配置完成"
+}
+
+# ================================================================
+# BBR 拥塞控制算法配置
+# 依赖内核编译时启用：
+#   CONFIG_TCP_CONG_BBR=m
+#   CONFIG_TCP_CONG_ADVANCED=y
+#   CONFIG_NET_SCH_FQ=m
+#   CONFIG_NET_SCH_FQ_CODEL=m
+# ================================================================
+setup_bbr() {
+    log_info "配置 BBR 拥塞控制算法..."
+
+    # ── 尝试加载内核模块（chroot 内可能失败，无妨）──
+    modprobe tcp_bbr 2>/dev/null \
+        && log_ok "tcp_bbr 模块加载成功" \
+        || log_warn "tcp_bbr 模块暂未加载（首次启动后自动生效）"
+
+    modprobe sch_fq 2>/dev/null \
+        && log_ok "sch_fq 模块加载成功" \
+        || log_warn "sch_fq 模块暂未加载（首次启动后自动生效）"
+
+    # ── 设置开机自动加载模块 ──
+    mkdir -p /etc/modules-load.d
+    cat > /etc/modules-load.d/bbr.conf << 'EOF'
+# BBR 拥塞控制 - 开机自动加载
+tcp_bbr
+sch_fq
+EOF
+    chmod 0644 /etc/modules-load.d/bbr.conf
+    log_ok "开机自动加载模块已配置: /etc/modules-load.d/bbr.conf"
+
+    # ── 写入 sysctl 持久化配置 ──
+    mkdir -p /etc/sysctl.d
+    cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
+# BBR 拥塞控制算法 + FQ 调度器
+# 依赖内核模块: tcp_bbr / sch_fq
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    chmod 0644 /etc/sysctl.d/99-bbr.conf
+    log_ok "BBR sysctl 配置已写入: /etc/sysctl.d/99-bbr.conf"
+
+    # ── chroot 内尝试立即生效（失败无妨，重启后必定生效）──
+    sysctl -w net.core.default_qdisc=fq 2>/dev/null \
+        && log_ok "net.core.default_qdisc=fq 已生效" || true
+    sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null \
+        && log_ok "net.ipv4.tcp_congestion_control=bbr 已生效" || true
+
+    log_ok "BBR 配置完成，重启后自动生效"
 }
 
 clean_file() {
@@ -297,25 +422,33 @@ clean_apt_cache() {
 main() {
     require_root
 
-    log_info "开始 chroot 构建（版本: $(date '+%Y-%m-%d %H:%M:%S')）"
+    log_info "开始 chroot 构建（$(date '+%Y-%m-%d %H:%M:%S')）"
     log_info "包目录: ${PKGS_DIR}"
     ls -la "${PKGS_DIR}/" 2>/dev/null || log_warn "包目录不存在或为空"
 
-    check_network
-    fix_tmp_permissions
-    remove_package
-    clean_file
-    install_package
+    check_network       # 检查网络 + 修复 resolv.conf
+    fix_tmp_permissions # 修复 /tmp 权限
+    remove_package      # 移除冲突旧内核
+    clean_file          # 清理 /boot
+    install_package     # 安装内核 + 系统组件
 
     log_info "设置 iptables 后端..."
-    update-alternatives --set iptables /usr/sbin/iptables-legacy || log_warn "iptables 设置失败"
+    update-alternatives --set iptables /usr/sbin/iptables-legacy \
+        || log_warn "iptables 设置失败"
 
-    set_language
-    common_set
-    enable_motd
-    clean_apt_cache
+    set_language        # 配置中文 + UTF-8
+    common_set          # 系统配置、SSH、时区、服务启用
+    setup_bbr           # ★ BBR 拥塞控制算法
+    enable_motd         # 启用 MOTD
+    clean_apt_cache     # 清理 APT 缓存
 
-    log_ok "chroot 构建全部完成"
+    log_ok "chroot 构建全部完成！"
+    log_info "════════════════════════════════════"
+    log_info "首次登录: ssh root@192.168.68.1"
+    log_info "默认密码: 1234"
+    log_info "时区: Asia/Shanghai (UTC+8)"
+    log_info "BBR: 重启后自动生效"
+    log_info "════════════════════════════════════"
 }
 
 main "$@"
