@@ -367,6 +367,7 @@ EOF
 # BBR 拥塞控制算法 + FQ 调度器
 # 依赖内核模块: tcp_bbr / sch_fq
 net.core.default_qdisc = fq
+net.core.default_qdisc = cake
 net.ipv4.tcp_congestion_control = bbr
 EOF
     chmod 0644 /etc/sysctl.d/99-bbr.conf
