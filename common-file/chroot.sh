@@ -331,32 +331,26 @@ PYEOF
     log_ok "系统配置完成"
 }
 
-# ================================================================
 # BBR 拥塞控制算法配置
-# 依赖内核编译时启用：
-#   CONFIG_TCP_CONG_BBR=m
-#   CONFIG_TCP_CONG_ADVANCED=y
-#   CONFIG_NET_SCH_FQ=m
-#   CONFIG_NET_SCH_FQ_CODEL=m
-# ================================================================
+
 setup_bbr() {
-    log_info "配置 BBR 拥塞控制算法..."
+    log_info "配置 BBR + CAKE 拥塞控制算法..."
 
     # ── 尝试加载内核模块（chroot 内可能失败，无妨）──
     modprobe tcp_bbr 2>/dev/null \
         && log_ok "tcp_bbr 模块加载成功" \
         || log_warn "tcp_bbr 模块暂未加载（首次启动后自动生效）"
 
-    modprobe sch_fq 2>/dev/null \
-        && log_ok "sch_fq 模块加载成功" \
-        || log_warn "sch_fq 模块暂未加载（首次启动后自动生效）"
+    modprobe sch_cake 2>/dev/null \
+        && log_ok "sch_cake 模块加载成功" \
+        || log_warn "sch_cake 模块暂未加载（首次启动后自动生效）"
 
     # ── 设置开机自动加载模块 ──
     mkdir -p /etc/modules-load.d
     cat > /etc/modules-load.d/bbr.conf << 'EOF'
-# BBR 拥塞控制 - 开机自动加载
+# BBR + CAKE 拥塞控制 - 开机自动加载
 tcp_bbr
-sch_fq
+sch_cake
 EOF
     chmod 0644 /etc/modules-load.d/bbr.conf
     log_ok "开机自动加载模块已配置: /etc/modules-load.d/bbr.conf"
@@ -364,22 +358,19 @@ EOF
     # ── 写入 sysctl 持久化配置 ──
     mkdir -p /etc/sysctl.d
     cat > /etc/sysctl.d/99-bbr.conf << 'EOF'
-# BBR 拥塞控制算法 + FQ 调度器
-# 依赖内核模块: tcp_bbr / sch_fq
-net.core.default_qdisc = fq
 net.core.default_qdisc = cake
 net.ipv4.tcp_congestion_control = bbr
 EOF
     chmod 0644 /etc/sysctl.d/99-bbr.conf
-    log_ok "BBR sysctl 配置已写入: /etc/sysctl.d/99-bbr.conf"
+    log_ok "BBR + CAKE sysctl 配置已写入: /etc/sysctl.d/99-bbr.conf"
 
     # ── chroot 内尝试立即生效（失败无妨，重启后必定生效）──
-    sysctl -w net.core.default_qdisc=fq 2>/dev/null \
-        && log_ok "net.core.default_qdisc=fq 已生效" || true
+    sysctl -w net.core.default_qdisc=cake 2>/dev/null \
+        && log_ok "net.core.default_qdisc=cake 已生效" || true
     sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null \
         && log_ok "net.ipv4.tcp_congestion_control=bbr 已生效" || true
 
-    log_ok "BBR 配置完成，重启后自动生效"
+    log_ok "BBR + CAKE 配置完成，重启后自动生效"
 }
 
 clean_file() {
