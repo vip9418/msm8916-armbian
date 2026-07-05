@@ -145,7 +145,7 @@ jobs:
           echo "✅ 基础 .config 已生成"
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: 🔧 注入 DAE + Docker 内核配置项
+      - name: 🔧 注入 DAE + Docker + BBR 内核配置项（v4）
         id: injectconfig
         if: ${{ steps.loadconfig.outputs.status == 'success' && !cancelled() }}
         run: |
@@ -155,7 +155,7 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║  [1/3] DAE 官方必须项 + SOCK_OPS 完整支持               ║"
+          echo "║  [1/4] DAE 官方必须项 + SOCK_OPS 完整支持               ║"
           echo "║  来源: github.com/daeuniverse/dae 官方 README            ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
@@ -180,7 +180,6 @@ jobs:
           $CFG --enable  CONFIG_CGROUP_BPF
 
           # ── SOCK_OPS 完整支持（修复 daed bpf_get_current_task 崩溃）──
-          # 这是 local_tcp_sockops 程序的必须依赖
           $CFG --enable  CONFIG_SOCK_CGROUP_DATA
           $CFG --enable  CONFIG_CGROUP_NET_CLASSID
           $CFG --enable  CONFIG_CGROUP_NET_PRIO
@@ -196,25 +195,33 @@ jobs:
           $CFG --enable  CONFIG_XDP_SOCKETS
           $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
 
-          # ── BBR 拥塞控制算法 ──
-          echo ""
-          echo "── BBR 拥塞控制算法 ──"
-          $CFG --enable  CONFIG_TCP_CONG_ADVANCED
-          $CFG --module  CONFIG_TCP_CONG_BBR
-          $CFG --module  CONFIG_NET_SCH_FQ
-          $CFG --module  CONFIG_NET_SCH_FQ_CODEL
-
-          # ── Tracing（dae 进程追踪，仅静态部分，不含动态修改）──
+          # ── Tracing（仅静态部分，不含 DYNAMIC_FTRACE 防止变砖）──
           $CFG --enable  CONFIG_TRACEPOINTS
-          $CFG --enable  CONFIG_KPROBE_EVENTS
           $CFG --enable  CONFIG_UPROBE_EVENTS
-          # ★ 不启用 CONFIG_FTRACE / CONFIG_DYNAMIC_FTRACE
-          #   原因：DYNAMIC_FTRACE 在 MSM8916 bootloader 上会导致变砖
-          #   DAE 不需要 ftrace，kprobe/uprobe 已足够
+          # ★ 不启用 CONFIG_FTRACE / CONFIG_DYNAMIC_FTRACE（MSM8916 变砖风险）
+          # ★ 不启用 CONFIG_BPF_LSM（需 bootloader 传参，MSM8916 不支持）
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║  [2/3] Docker 官方必须项                                 ║"
+          echo "║  [2/4] BBR + CAKE 网络加速                              ║"
+          echo "║  BBR: 高性能拥塞控制  CAKE: 网关专用队列调度器           ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # ── BBR 拥塞控制 ──
+          $CFG --enable  CONFIG_TCP_CONG_ADVANCED
+          $CFG --module  CONFIG_TCP_CONG_BBR
+
+          # ── CAKE 队列调度器（首选，专为路由器/网关设计）──
+          # 不做 pacing，Docker 多流并发正常，与 DAE 代理配合最佳
+          $CFG --module  CONFIG_NET_SCH_CAKE
+
+          # ── FQ / FQ_CODEL 保留备用 ──
+          $CFG --module  CONFIG_NET_SCH_FQ
+          $CFG --module  CONFIG_NET_SCH_FQ_CODEL
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  [3/4] Docker 官方必须项                                 ║"
           echo "║  来源: github.com/docker/docker/contrib/check-config.sh  ║"
           echo "╚══════════════════════════════════════════════════════════╝"
 
@@ -283,7 +290,7 @@ jobs:
 
           echo ""
           echo "╔══════════════════════════════════════════════════════════╗"
-          echo "║  [3/3] make olddefconfig 解决依赖关系                    ║"
+          echo "║  [4/4] make olddefconfig 解决依赖关系                    ║"
           echo "╚══════════════════════════════════════════════════════════╝"
           make olddefconfig
 
@@ -309,8 +316,16 @@ jobs:
           echo ""
           echo "--- SOCK_OPS（daed 崩溃修复）---"
           for key in CONFIG_BPF_STREAM_PARSER CONFIG_SOCK_CGROUP_DATA \
-                     CONFIG_CGROUP_NET_CLASSID CONFIG_CGROUP_NET_PRIO \
-                     CONFIG_BPF_JIT_ALWAYS_ON; do
+                     CONFIG_CGROUP_NET_CLASSID CONFIG_CGROUP_NET_PRIO; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo ""
+          echo "--- BBR + CAKE 网络加速 ---"
+          for key in CONFIG_TCP_CONG_ADVANCED CONFIG_TCP_CONG_BBR \
+                     CONFIG_NET_SCH_CAKE CONFIG_NET_SCH_FQ \
+                     CONFIG_NET_SCH_FQ_CODEL; do
             result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
             echo "  ${key}: ${result##*=}"
           done
@@ -318,10 +333,10 @@ jobs:
           echo ""
           echo "--- 安全排除项（防止变砖）---"
           grep "^CONFIG_BPF_LSM=" .config \
-            && echo "  ⚠️  CONFIG_BPF_LSM 仍存在，可能导致变砖！" \
+            && echo "  ⚠️  CONFIG_BPF_LSM 存在，可能导致变砖！" \
             || echo "  ✅ CONFIG_BPF_LSM 未启用（安全）"
           grep "^CONFIG_DYNAMIC_FTRACE=" .config \
-            && echo "  ⚠️  CONFIG_DYNAMIC_FTRACE 仍存在，可能导致变砖！" \
+            && echo "  ⚠️  CONFIG_DYNAMIC_FTRACE 存在，可能导致变砖！" \
             || echo "  ✅ CONFIG_DYNAMIC_FTRACE 未启用（安全）"
 
           echo ""
