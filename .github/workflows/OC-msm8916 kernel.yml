@@ -31,7 +31,6 @@ on:
           - "1400"
           - "1600"
           - "1900"
-      # ✅ 新增：nomodem 裁剪选项
       enable_nomodem:
         description: "裁剪 Modem/GPS（释放约 88MB 内存，启用后 SIM 卡/LTE 失效）"
         required: false
@@ -296,84 +295,197 @@ jobs:
         env:
           TARGET_MHZ: ${{ inputs.overclock_freq }}
           PATCH_SCRIPT: |
-            import re, sys
+            import re, sys, os, glob
 
-            dts_path   = sys.argv[1]
-            target_mhz = int(sys.argv[2])
+            DTS_DIR    = "arch/arm64/boot/dts/qcom"
+            TARGET_MHZ = int(sys.argv[1])
+            TARGET_HZ  = TARGET_MHZ * 1000000
 
-            opp_map = {
-                1400: (1400000000, 1200000),
-                1600: (1600000000, 1225000),
-                1900: (1900000000, 1250000),
-            }
+            # OPP 频率档位（Hz），注入到 CPU OPP 表
+            OPP_LEVELS = [
+                1324800000,
+                1401600000,
+                1497600000,
+                1593600000,
+                1900800000,
+            ]
+            levels = [hz for hz in OPP_LEVELS if hz <= TARGET_HZ]
 
-            levels = [(hz, uv) for mhz, (hz, uv) in sorted(opp_map.items()) if mhz <= target_mhz]
-
-            with open(dts_path, "r") as f:
-                content = f.read()
-
-            if "1400000000" in content:
-                print("already patched, skip")
-                sys.exit(0)
-
-            block = "\n\t\t/* overclock target: {}MHz */\n".format(target_mhz)
-            for hz, uv in levels:
-                block += "\t\topp-{} {{\n".format(hz)
-                block += "\t\t\topp-hz = /bits/ 64 <{}>;\n".format(hz)
-                block += "\t\t\topp-microvolt = <{}>;\n".format(uv)
-                block += "\t\t\tturbo-mode;\n"
-                block += "\t\t};\n"
-
-            pat = re.compile(r"(opp-\d+\s*\{[^}]*opp-hz\s*=[^}]*\};)", re.DOTALL)
-            ms  = list(pat.finditer(content))
-            if not ms:
-                print("ERROR: no opp blocks found")
+            if not levels:
+                print(f"ERROR: 目标 {TARGET_MHZ}MHz 低于最小超频档，退出")
                 sys.exit(1)
 
-            pos = ms[-1].end()
-            with open(dts_path, "w") as f:
-                f.write(content[:pos] + "\n" + block + content[pos:])
+            # 读取所有相关 dtsi/dts 文件
+            dtsi_files  = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
+            dtsi_files += glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
 
-            print("patched: {}".format(dts_path))
-            for hz, uv in levels:
-                print("  {}MHz @ {}mV".format(hz // 1000000, uv // 1000))
+            all_files = {}
+            for fpath in dtsi_files:
+                with open(fpath, "r") as f:
+                    all_files[fpath] = f.read()
+
+            # 扫描电源域标签（rpmpd_opp_xxx）
+            pwr_labels = set()
+            for content in all_files.values():
+                for m in re.finditer(r'(rpmpd_opp_\w+)\s*:', content):
+                    pwr_labels.add(m.group(1))
+
+            print(f"  [扫描] 电源域标签: {sorted(pwr_labels)}")
+
+            # 选择最高档电源域
+            PRIORITY = [
+                "rpmpd_opp_turbo_krait",
+                "rpmpd_opp_turbo",
+                "rpmpd_opp_nom_krait",
+                "rpmpd_opp_nom",
+            ]
+            OC_PWR = None
+            for p in PRIORITY:
+                if p in pwr_labels:
+                    OC_PWR = p
+                    break
+            if OC_PWR is None and pwr_labels:
+                OC_PWR = sorted(pwr_labels)[-1]
+
+            print(f"  [确认] 超频使用电源域: {OC_PWR}")
+
+            # 定位 CPU OPP 表所在文件
+            # 判断依据：包含 CPU 典型标记频率
+            CPU_MARKER_HZ = [
+                "998400000",
+                "1209600000",
+                "1094400000",
+                "1152000000",
+            ]
+
+            cpu_opp_file    = None
+            cpu_opp_content = None
+
+            for fpath, content in all_files.items():
+                if any(marker in content for marker in CPU_MARKER_HZ):
+                    cpu_opp_file    = fpath
+                    cpu_opp_content = content
+                    print(f"  [定位] CPU OPP 表所在文件: {os.path.basename(fpath)}")
+                    break
+
+            if cpu_opp_file is None:
+                print("ERROR: 未找到包含 CPU OPP 表的文件")
+                sys.exit(1)
+
+            # 找到 CPU 标记频率的位置
+            cpu_marker_pos = -1
+            for marker in CPU_MARKER_HZ:
+                pos = cpu_opp_content.find(marker)
+                if pos != -1:
+                    cpu_marker_pos = pos
+                    print(f"  [定位] CPU 标记频率 {marker} 在字符位置: {pos}")
+                    break
+
+            if cpu_marker_pos == -1:
+                print("ERROR: 在文件中找不到 CPU 标记频率")
+                sys.exit(1)
+
+            # 向前找最近的 cpu opp-table 块起始
+            table_start_pat = re.compile(
+                r'(?:cpu_opp_table|opp-table)[^{]*\{',
+                re.DOTALL
+            )
+            table_start = 0
+            for m in table_start_pat.finditer(cpu_opp_content):
+                if m.start() < cpu_marker_pos:
+                    table_start = m.start()
+
+            print(f"  [定位] CPU OPP 表起始位置: {table_start}")
+
+            # 只在 CPU OPP 表范围内搜索 opp-xxx 块
+            content_from_table = cpu_opp_content[table_start:]
+
+            opp_block_pat = re.compile(
+                r'\bopp-\d+\s*\{[^{}]*\};',
+                re.DOTALL
+            )
+            cpu_opp_matches = list(opp_block_pat.finditer(content_from_table))
+
+            if not cpu_opp_matches:
+                print("ERROR: 在 CPU OPP 表范围内未找到任何 opp-xxx 块")
+                sys.exit(1)
+
+            last_cpu_opp = cpu_opp_matches[-1]
+            insert_pos   = table_start + last_cpu_opp.end()
+
+            print(f"  [定位] CPU OPP 表内共 {len(cpu_opp_matches)} 个条目")
+            print(f"  [定位] 注入绝对位置: {insert_pos}")
+
+            # 幂等检查
+            if str(levels[0]) in cpu_opp_content:
+                print(f"  [跳过] {levels[0]//1000000}MHz OPP 已存在，无需重复注入")
+                sys.exit(0)
+
+            # 构造新 OPP 块（required-opps 格式，Linux 6.x 主线）
+            insert_block = f"\n\t\t/* overclock: injected by CI, target {TARGET_MHZ}MHz */\n"
+            for hz in levels:
+                mhz = hz // 1000000
+                if OC_PWR:
+                    insert_block += (
+                        f"\t\topp-{hz} {{\n"
+                        f"\t\t\topp-hz = /bits/ 64 <{hz}>;\n"
+                        f"\t\t\trequired-opps = <&{OC_PWR}>;\n"
+                        f"\t\t}};\n"
+                    )
+                else:
+                    insert_block += (
+                        f"\t\topp-{hz} {{\n"
+                        f"\t\t\topp-hz = /bits/ 64 <{hz}>;\n"
+                        f"\t\t\topp-microvolt = <1250000>;\n"
+                        f"\t\t}};\n"
+                    )
+                print(f"  [注入] {mhz}MHz"
+                      + (f" → required-opps = <&{OC_PWR}>" if OC_PWR else " → opp-microvolt fallback"))
+
+            # 写入文件
+            new_content = (
+                cpu_opp_content[:insert_pos]
+                + insert_block
+                + cpu_opp_content[insert_pos:]
+            )
+
+            with open(cpu_opp_file, "w") as f:
+                f.write(new_content)
+
+            print(f"\n✅ 超频补丁已写入: {cpu_opp_file}")
+
+            # 验证：打印注入后 CPU OPP 频率列表
+            print("\n=== 注入后 CPU OPP 频率列表 ===")
+            for m in opp_block_pat.finditer(new_content[table_start:]):
+                hz_m = re.search(r'opp-hz\s*=\s*/bits/\s*64\s*<(\d+)>', m.group())
+                if hz_m:
+                    hz  = int(hz_m.group(1))
+                    mhz = hz / 1_000_000
+                    tag = " ← 新增" if hz in levels else ""
+                    print(f"  {mhz:.1f} MHz{tag}")
         run: |
           cd /builder/kernel
 
-          echo "超频目标: ${TARGET_MHZ} MHz"
-          echo "警告: MSM8916 原厂最高 1200MHz，UFI001C 无散热，风险自负"
+          echo "════════════════════════════════════════════════"
+          echo "  超频目标: ${TARGET_MHZ} MHz"
+          echo "  警告: MSM8916 原厂最高 1209.6MHz，超频存在损坏风险"
+          echo "════════════════════════════════════════════════"
 
-          DTS_FILE=""
-          for f in \
-            "arch/arm64/boot/dts/qcom/msm8916.dtsi" \
-            "arch/arm64/boot/dts/qcom/msm8916-ufi.dtsi" \
-            "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"; do
-            if [ -f "$f" ]; then
-              DTS_FILE="$f"
-              echo "找到 DTS 文件: ${DTS_FILE}"
-              break
-            fi
-          done
+          echo "注入前 CPU OPP 表（原始最高频率）:"
+          grep -rn "opp-hz" arch/arm64/boot/dts/qcom/msm8916*.dtsi \
+            2>/dev/null | grep -v "19200000" | tail -10 || true
 
-          if [ -z "${DTS_FILE}" ]; then
-            echo "未找到 DTS 文件，列出相关文件:"
-            find arch/arm64/boot/dts/qcom/ \( -name "*.dtsi" -o -name "*.dts" \) \
-              | grep -i "msm8916\|ufi" | head -20 || true
-            exit 1
-          fi
-
-          echo "修改前 OPP 配置:"
-          grep -n "opp-hz\|opp-microvolt\|opp-[0-9]" "${DTS_FILE}" | head -30 || true
-
+          echo ""
           printf '%s' "${PATCH_SCRIPT}" > /tmp/patch_opp.py
-          python3 /tmp/patch_opp.py "${DTS_FILE}" "${TARGET_MHZ}"
+          python3 /tmp/patch_opp.py "${TARGET_MHZ}"
 
-          echo "修改后 OPP 配置:"
-          grep -n "opp-hz\|opp-microvolt\|turbo-mode" "${DTS_FILE}" || true
+          echo ""
+          echo "注入后验证（搜索超频标记）:"
+          grep -rn "overclock.*injected" \
+            arch/arm64/boot/dts/qcom/msm8916*.dtsi 2>/dev/null || true
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-         
       - name: 注入 No-Modem 补丁（裁剪 Modem/GPS，释放约 88MB 内存）
         id: nomodem
         if: ${{ fromJSON(inputs.enable_nomodem) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
@@ -384,26 +496,29 @@ jobs:
             DTS_DIR    = "arch/arm64/boot/dts/qcom"
             DEVICE_DTS = os.path.join(DTS_DIR, "msm8916-thwc-ufi001c.dts")
 
-            # ================================================================
-            # reserved-memory 子节点：只能 /delete-node/ 删除
-            # 这类节点没有独立 DTS 标签，不能用 &label 引用
-            # ================================================================
+            # reserved-memory 子节点扫描配置
+            # 地址正则要求至少 6 位十六进制，过滤 wcnss@6 等假匹配
             RESERVED_MEM_LABELS = {
                 "mpss_mem":  ["mpss_mem",  "mpss@"],
-                "mba_mem":   ["mba_mem",   "mba@"],
+                "mba_mem":   ["mba_mem",   "mba@", "mpss_boot_mem", "mba_region"],
                 "wcnss_mem": ["wcnss_mem", "wcnss@"],
                 "rmtfs_mem": ["rmtfs_mem", "rmtfs@"],
                 "rfsa_mem":  ["rfsa_mem",  "rfsa@"],
             }
 
-            # ================================================================
-            # remoteproc 设备节点候选：用 /delete-node/ &label; 整棵删除
-            # 整棵删除可以同时消灭所有子节点中的 phandle 引用
-            # 不再使用 status=disabled + delete-property，避免子节点遗漏
-            # ================================================================
+            # 兜底地址（主线 Linux 6.x MSM8916 标准布局）
+            FALLBACK_NODES = {
+                "mpss_mem":  "mpss@86800000",
+                "mba_mem":   "mba@8ea00000",
+                "wcnss_mem": "wcnss@8b600000",
+                "rmtfs_mem": "rmtfs@86700000",
+                "rfsa_mem":  "rfsa@867e0000",
+            }
+
+            # remoteproc 设备节点候选（整棵删除）
             REMOTEPROC_CANDIDATES = ["mpss", "wcnss", "hexagon"]
 
-            # ── 读取所有相关 dtsi/dts 文件 ──────────────────────────────────
+            # 读取所有相关 dtsi/dts 文件
             dtsi_files  = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
             dtsi_files += glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
 
@@ -412,27 +527,41 @@ jobs:
                 with open(fpath, "r") as f:
                     all_content[fpath] = f.read()
 
-            # ── 第一步：扫描 reserved-memory 节点名（带单元地址）────────────
-            found_reserved = {}   # label -> "node-name@addr"
+            # 第一步：扫描 reserved-memory 节点名
+            # ★ 核心修复：地址部分要求至少 6 位十六进制（{6,}），
+            #   过滤掉 wcnss@6 / mba@1 等因换行截断产生的错误短匹配
+            found_reserved = {}
+
             for fpath, content in all_content.items():
                 for label, keywords in RESERVED_MEM_LABELS.items():
                     if label in found_reserved:
                         continue
                     for kw in keywords:
+                        base = kw.rstrip('@')
                         pat = re.compile(
                             r'(?:' + re.escape(label) + r'\s*:\s*)?'
-                            r'(' + re.escape(kw.rstrip('@')) + r'@[0-9a-fA-F]+)',
+                            r'(' + re.escape(base) + r'@[0-9a-fA-F]{6,})',
                             re.IGNORECASE
                         )
                         m = pat.search(content)
                         if m:
                             found_reserved[label] = m.group(1)
-                            print(f"  [扫描] reserved-memory: {label} → "
-                                  f"{m.group(1)} ({os.path.basename(fpath)})")
+                            print(f"  [扫描] {label} → {m.group(1)} "
+                                  f"({os.path.basename(fpath)})")
                             break
 
-            # ── 第二步：扫描真实 remoteproc 标签定义 ────────────────────────
-            # 必须是 "label: nodename@addr {" 形式，确认标签真实存在
+            # 兜底补全：扫描失败的项用已知地址补全
+            for label, fallback in FALLBACK_NODES.items():
+                if label not in found_reserved:
+                    found_reserved[label] = fallback
+                    print(f"  [兜底] {label} → {fallback}（扫描未找到）")
+
+            print(f"\n  [确认] 将删除以下 reserved-memory 节点:")
+            for label, node in found_reserved.items():
+                print(f"         {node}")
+
+            # 第二步：扫描真实 remoteproc 标签定义
+            # 必须是 "label: nodename@addr {" 形式才认为标签真实存在
             found_remoteprocs = []
             for candidate in REMOTEPROC_CANDIDATES:
                 label_pat = re.compile(
@@ -446,9 +575,9 @@ jobs:
                     found_remoteprocs.append(candidate)
                     print(f"  [扫描] remoteproc 标签存在: &{candidate}")
                 else:
-                    print(f"  [跳过] &{candidate} 无标签定义，不生成 delete-node")
+                    print(f"  [跳过] &{candidate} 无标签定义")
 
-            # ── 第三步：构造追加到设备 DTS 末尾的 patch 片段 ────────────────
+            # 第三步：构造追加到设备 DTS 末尾的 patch 片段
             patch_lines = [
                 "",
                 "/*",
@@ -461,18 +590,18 @@ jobs:
                 "",
             ]
 
-            # 3-A：整棵删除 remoteproc 节点
-            #      /delete-node/ &label; 会删除该节点及其所有子节点
-            #      子节点中的 memory-region phandle 引用也会一并消除
-            #      必须在删除 reserved-memory 节点之前执行
+            # 3-A：整棵删除 remoteproc 节点（必须在删 reserved-memory 之前）
+            # /delete-node/ &label; 会删除节点及其所有子节点
+            # 子节点中的 memory-region phandle 引用也一并消除
             if found_remoteprocs:
-                patch_lines.append("/* Step1: 整棵删除 remoteproc 节点（含子节点所有 phandle 引用）*/")
+                patch_lines.append(
+                    "/* Step1: 整棵删除 remoteproc 节点（含子节点所有 phandle 引用）*/"
+                )
                 for lbl in found_remoteprocs:
                     patch_lines.append(f"/delete-node/ &{lbl};")
                     print(f"  [注入] /delete-node/ &{lbl};")
                 patch_lines.append("")
             else:
-                # 兜底：直接删除 &mpss
                 print("  [兜底] 未扫描到 remoteproc 标签，直接删除 &mpss")
                 patch_lines += [
                     "/* Step1: 整棵删除 remoteproc 节点（兜底）*/",
@@ -480,32 +609,18 @@ jobs:
                     "",
                 ]
 
-            # 3-B：删除 reserved-memory 中的节点
+            # 3-B：删除 reserved-memory 中的所有 modem 相关节点
             patch_lines += [
                 "/* Step2: 删除 modem reserved-memory 分区 */",
                 "/ {",
                 "\treserved-memory {",
             ]
-
-            if found_reserved:
-                for label, node_name in found_reserved.items():
-                    patch_lines.append(f"\t\t/delete-node/ {node_name};")
-                    print(f"  [注入] /delete-node/ {node_name};")
-            else:
-                print("  [警告] 未扫描到节点地址，使用已知主线兜底地址")
-                for line in [
-                    "/delete-node/ mpss@86800000;",
-                    "/delete-node/ mba@8ea00000;",
-                    "/delete-node/ wcnss@8b600000;",
-                    "/delete-node/ rmtfs@86700000;",
-                    "/delete-node/ rfsa@867e0000;",
-                ]:
-                    patch_lines.append(f"\t\t{line}")
-                    print(f"  [兜底] {line}")
-
+            for label, node_name in found_reserved.items():
+                patch_lines.append(f"\t\t/delete-node/ {node_name};")
+                print(f"  [注入] /delete-node/ {node_name};")
             patch_lines += ["\t};", "};", ""]
 
-            # ── 第四步：追加到设备 DTS 末尾（含幂等检查）───────────────────
+            # 第四步：追加到设备 DTS 末尾（含幂等检查）
             with open(DEVICE_DTS, "r") as f:
                 original = f.read()
 
@@ -600,7 +715,7 @@ jobs:
 
           KERNEL_VER="${{ env.kernel_version }}"
 
-          # ✅ 后缀组合：超频 + nomodem 均可独立或叠加
+          # 后缀组合：超频 + nomodem 均可独立或叠加
           # 例: 6.18.0.tar.gz
           #     6.18.0-oc1600.tar.gz
           #     6.18.0-nomodem.tar.gz
