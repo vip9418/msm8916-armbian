@@ -292,18 +292,22 @@ jobs:
           # ================================================================
           BASE_VER_PAT="[0-9]+\\.[0-9]+\\.[0-9]+"
 
-          case "${KERNEL_TYPE}" in
+                    case "${KERNEL_TYPE}" in
             normal)
               JQ_PATTERN="^${BASE_VER_PAT}\\.tar\\.gz$"
+              echo "📌 匹配模式: 标准内核（无后缀）"
               ;;
             nomodem)
               JQ_PATTERN="^${BASE_VER_PAT}-nomodem\\.tar\\.gz$"
+              echo "📌 匹配模式: NoModem 内核"
               ;;
-            oc1400|oc1600|oc1900)
+            oc1400|oc1600|oc1800|oc2000|oc2100)
               JQ_PATTERN="^${BASE_VER_PAT}-${KERNEL_TYPE}\\.tar\\.gz$"
+              echo "📌 匹配模式: 超频内核（后缀 -${KERNEL_TYPE}）"
               ;;
-            oc1400-nomodem|oc1600-nomodem|oc1900-nomodem)
+            oc1400-nomodem|oc1600-nomodem|oc1800-nomodem|oc2000-nomodem|oc2100-nomodem)
               JQ_PATTERN="^${BASE_VER_PAT}-${KERNEL_TYPE}\\.tar\\.gz$"
+              echo "📌 匹配模式: 超频+NoModem 内核（后缀 -${KERNEL_TYPE}）"
               ;;
             *)
               echo "❌ 未知 kernel_type: ${KERNEL_TYPE}"
