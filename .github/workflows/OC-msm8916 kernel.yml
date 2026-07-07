@@ -301,7 +301,9 @@ jobs:
             TARGET_MHZ = int(sys.argv[1])
             TARGET_HZ  = TARGET_MHZ * 1000000
 
-            # OPP 频率档位（Hz），注入到 CPU OPP 表
+            # OPP 频率档位（Hz）
+            # ★ 修复：向上取整匹配，选取所有 <= TARGET_MHZ+1MHz 的档位
+            #   避免 1900MHz 目标过滤掉 1900.8MHz 档
             OPP_LEVELS = [
                 1324800000,
                 1401600000,
@@ -309,7 +311,8 @@ jobs:
                 1593600000,
                 1900800000,
             ]
-            levels = [hz for hz in OPP_LEVELS if hz <= TARGET_HZ]
+            # 选取所有不超过 (目标+1MHz) 的档位，确保最近档位被包含
+            levels = [hz for hz in OPP_LEVELS if hz <= TARGET_HZ + 1_000_000]
 
             if not levels:
                 print(f"ERROR: 目标 {TARGET_MHZ}MHz 低于最小超频档，退出")
@@ -350,7 +353,6 @@ jobs:
             print(f"  [确认] 超频使用电源域: {OC_PWR}")
 
             # 定位 CPU OPP 表所在文件
-            # 判断依据：包含 CPU 典型标记频率
             CPU_MARKER_HZ = [
                 "998400000",
                 "1209600000",
@@ -396,24 +398,42 @@ jobs:
                     table_start = m.start()
 
             print(f"  [定位] CPU OPP 表起始位置: {table_start}")
+            depth       = 0
+            table_end   = len(cpu_opp_content)
+            in_table    = False
 
-            # 只在 CPU OPP 表范围内搜索 opp-xxx 块
-            content_from_table = cpu_opp_content[table_start:]
+            for i, ch in enumerate(cpu_opp_content[table_start:], start=table_start):
+                if ch == '{':
+                    depth += 1
+                    in_table = True
+                elif ch == '}':
+                    depth -= 1
+                    if in_table and depth == 0:
+                        table_end = i + 1   # 包含最后的 '}'
+                        break
+
+            print(f"  [定位] CPU OPP 表结束位置: {table_end}")
+
+            # 只在 CPU OPP table 范围内搜索 opp-xxx 块
+            cpu_table_content = cpu_opp_content[table_start:table_end]
 
             opp_block_pat = re.compile(
                 r'\bopp-\d+\s*\{[^{}]*\};',
                 re.DOTALL
             )
-            cpu_opp_matches = list(opp_block_pat.finditer(content_from_table))
+            cpu_opp_matches = list(opp_block_pat.finditer(cpu_table_content))
 
             if not cpu_opp_matches:
                 print("ERROR: 在 CPU OPP 表范围内未找到任何 opp-xxx 块")
                 sys.exit(1)
 
             last_cpu_opp = cpu_opp_matches[-1]
+            # 注入位置 = table_start 偏移 + 最后一个 CPU OPP 块结束位置
             insert_pos   = table_start + last_cpu_opp.end()
 
             print(f"  [定位] CPU OPP 表内共 {len(cpu_opp_matches)} 个条目")
+            print(f"  [定位] 最后 CPU OPP 块: "
+                  f"{cpu_table_content[last_cpu_opp.start():last_cpu_opp.end()].strip()[:60]}...")
             print(f"  [定位] 注入绝对位置: {insert_pos}")
 
             # 幂等检查
@@ -424,7 +444,7 @@ jobs:
             # 构造新 OPP 块（required-opps 格式，Linux 6.x 主线）
             insert_block = f"\n\t\t/* overclock: injected by CI, target {TARGET_MHZ}MHz */\n"
             for hz in levels:
-                mhz = hz // 1000000
+                mhz = hz / 1_000_000
                 if OC_PWR:
                     insert_block += (
                         f"\t\topp-{hz} {{\n"
@@ -439,7 +459,7 @@ jobs:
                         f"\t\t\topp-microvolt = <1250000>;\n"
                         f"\t\t}};\n"
                     )
-                print(f"  [注入] {mhz}MHz"
+                print(f"  [注入] {mhz:.1f}MHz"
                       + (f" → required-opps = <&{OC_PWR}>" if OC_PWR else " → opp-microvolt fallback"))
 
             # 写入文件
@@ -454,9 +474,10 @@ jobs:
 
             print(f"\n✅ 超频补丁已写入: {cpu_opp_file}")
 
-            # 验证：打印注入后 CPU OPP 频率列表
-            print("\n=== 注入后 CPU OPP 频率列表 ===")
-            for m in opp_block_pat.finditer(new_content[table_start:]):
+            # 验证：打印注入后 CPU OPP table 范围内的全部频率
+            new_table_content = new_content[table_start:table_end + len(insert_block)]
+            print("\n=== 注入后 CPU OPP 频率列表（仅 CPU 表范围）===")
+            for m in opp_block_pat.finditer(new_table_content):
                 hz_m = re.search(r'opp-hz\s*=\s*/bits/\s*64\s*<(\d+)>', m.group())
                 if hz_m:
                     hz  = int(hz_m.group(1))
@@ -526,10 +547,6 @@ jobs:
             for fpath in dtsi_files:
                 with open(fpath, "r") as f:
                     all_content[fpath] = f.read()
-
-            # 第一步：扫描 reserved-memory 节点名
-            # ★ 核心修复：地址部分要求至少 6 位十六进制（{6,}），
-            #   过滤掉 wcnss@6 / mba@1 等因换行截断产生的错误短匹配
             found_reserved = {}
 
             for fpath, content in all_content.items():
@@ -559,9 +576,7 @@ jobs:
             print(f"\n  [确认] 将删除以下 reserved-memory 节点:")
             for label, node in found_reserved.items():
                 print(f"         {node}")
-
-            # 第二步：扫描真实 remoteproc 标签定义
-            # 必须是 "label: nodename@addr {" 形式才认为标签真实存在
+                
             found_remoteprocs = []
             for candidate in REMOTEPROC_CANDIDATES:
                 label_pat = re.compile(
@@ -590,9 +605,6 @@ jobs:
                 "",
             ]
 
-            # 3-A：整棵删除 remoteproc 节点（必须在删 reserved-memory 之前）
-            # /delete-node/ &label; 会删除节点及其所有子节点
-            # 子节点中的 memory-region phandle 引用也一并消除
             if found_remoteprocs:
                 patch_lines.append(
                     "/* Step1: 整棵删除 remoteproc 节点（含子节点所有 phandle 引用）*/"
