@@ -11,7 +11,16 @@ on:
         options:
           - both
           - ufi001c
-          - ufi003
+      kernel_type:
+        description: "选择内核类型（normal=标准频率 / oc=超频）"
+        required: false
+        default: "normal"
+        type: choice
+        options:
+          - normal
+          - oc1400
+          - oc1600
+          - oc1900
       retry_count:
         description: "网络下载失败时的最大重试次数"
         required: false
@@ -114,10 +123,11 @@ jobs:
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "✅ 本次发布标签: ${TAG_NAME}"
           echo "目标设备: ${{ inputs.target_device }}"
+          echo "内核类型: ${{ inputs.kernel_type }}"
           echo "最大重试: ${{ inputs.retry_count }} 次"
 
   build:
-    name: "🔨 构建 [${{ matrix.version }}] → ${{ inputs.target_device }}"
+    name: "🔨 构建 [${{ matrix.version }}] → ${{ inputs.target_device }}[${{ inputs.kernel_type }}]"
     needs: get-versions
     runs-on: ubuntu-latest
     strategy:
@@ -242,28 +252,75 @@ jobs:
         run: |
           echo "════════════════════════════════════════════════"
           echo "  来源: 本仓库 Release tag: kernel_stable"
+          echo "  内核类型: ${{ inputs.kernel_type }}"
           echo "════════════════════════════════════════════════"
 
           mkdir -p kernel_debs
           cd kernel_debs
           MAX_RETRY=${{ inputs.retry_count }}
           API_URL="https://api.github.com/repos/${{ github.repository }}/releases/tags/kernel_stable"
+          KERNEL_TYPE="${{ inputs.kernel_type }}"
 
           for i in $(seq 1 $MAX_RETRY); do
             KERNEL_ASSETS_JSON=$(curl -sL -H "Authorization: Bearer $GH_TOKEN" "${API_URL}")
-            KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r \
-              '.assets[] | select(.name | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz$")) | .browser_download_url' \
-              | head -n 1)
-            [ -n "${KERNEL_TAR_URL}" ] && [ "${KERNEL_TAR_URL}" != "null" ] && break
+            if echo "$KERNEL_ASSETS_JSON" | jq -e '.assets' >/dev/null 2>&1; then
+              break
+            fi
             echo "⚠️  获取内核包信息第 ${i}/${MAX_RETRY} 次重试..."
             sleep 10
           done
 
+          # ================================================================
+          # 根据 kernel_type 匹配不同文件名格式：
+          #   normal → ^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$
+          #            例: 6.18.0.tar.gz
+          #   oc1400 → ^[0-9]+\.[0-9]+\.[0-9]+-oc1400\.tar\.gz$
+          #            例: 6.18.0-oc1400.tar.gz
+          # ================================================================
+          if [[ "${KERNEL_TYPE}" == "normal" ]]; then
+            JQ_PATTERN='^[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$'
+            echo "📌 匹配模式: 标准内核（无后缀）"
+          else
+            JQ_PATTERN="^[0-9]+\\.[0-9]+\\.[0-9]+-${KERNEL_TYPE}\\.tar\\.gz$"
+            echo "📌 匹配模式: 超频内核（后缀 -${KERNEL_TYPE}）"
+          fi
+
+          KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r \
+            --arg pat "$JQ_PATTERN" \
+            '.assets[] | select(.name | test($pat)) | .browser_download_url' \
+            | head -n 1)
+
+          # 兜底策略：精确匹配失败时放宽匹配
           if [ -z "${KERNEL_TAR_URL}" ] || [ "${KERNEL_TAR_URL}" = "null" ]; then
-            echo "❌ 错误: 未找到 kernel_stable 中的内核 tar.gz 包"
-            echo "   请先运行 compile-msm8916-kernel.yml 生成内核"
+            echo "⚠️  精确匹配失败，尝试宽松匹配..."
+            if [[ "${KERNEL_TYPE}" == "normal" ]]; then
+              KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r \
+                '.assets[] | select(.name | test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.tar\\.gz$")) | .browser_download_url' \
+                | head -n 1)
+            else
+              KERNEL_TAR_URL=$(echo "$KERNEL_ASSETS_JSON" | jq -r \
+                --arg oc "${KERNEL_TYPE}" \
+                '.assets[] | select(.name | contains($oc)) | select(.name | endswith(".tar.gz")) | .browser_download_url' \
+                | head -n 1)
+            fi
+          fi
+
+          if [ -z "${KERNEL_TAR_URL}" ] || [ "${KERNEL_TAR_URL}" = "null" ]; then
+            echo "❌ 错误: 未找到 [${KERNEL_TYPE}] 类型的内核 tar.gz 包"
+            echo ""
+            echo "   kernel_stable Release 中现有文件列表:"
+            echo "$KERNEL_ASSETS_JSON" | jq -r '.assets[] | "   - \(.name)"' || true
+            echo ""
+            echo "   请确认内核编译 Workflow 已使用对应参数构建并上传"
             exit 1
           fi
+
+          KERNEL_TAR_NAME=$(basename "${KERNEL_TAR_URL}")
+          echo "✅ 找到内核包: ${KERNEL_TAR_NAME}"
+          echo "   下载地址: ${KERNEL_TAR_URL}"
+
+          # 将内核类型写入环境变量，供步骤 9 Release Body 使用
+          echo "KERNEL_TYPE_TAG=${KERNEL_TYPE}" >> $GITHUB_ENV
 
           for i in $(seq 1 $MAX_RETRY); do
             wget -q --show-progress "${KERNEL_TAR_URL}" -O kernel-package.tar.gz && break
@@ -277,7 +334,7 @@ jobs:
             exit 1
           fi
 
-          echo "🔓 解压内核包..."
+          echo "🔓 解压内核包: ${KERNEL_TAR_NAME}"
           tar -xzvf kernel-package.tar.gz
 
           IMAGE_DEB=$(find . -name "*image*.deb" ! -name "linux-image.deb" | head -n 1)
@@ -338,9 +395,6 @@ jobs:
           echo "  chroot 脚本来源: common-file/chroot.sh"
           echo "════════════════════════════════════════════════"
 
-          # ================================================================
-          # 验证 chroot.sh 是否存在于本仓库 common-file 目录
-          # ================================================================
           if [ ! -f "common-file/chroot.sh" ]; then
             echo "❌ 错误: common-file/chroot.sh 不存在！"
             echo "   请确认仓库中存在该文件"
@@ -393,11 +447,6 @@ jobs:
           echo "📋 复制原始 rootfs 到工作目录..."
           cp -a "${ORIG_DIR}/." "${TEMP_DIR}/"
 
-          # ================================================================
-          # 准备 chroot 内的 /tmp/local_packages 目录
-          # 注意：chroot.sh 中 PKGS_DIR="/tmp/local_packages"
-          # 所有 deb 包和脚本文件都必须复制到这里
-          # ================================================================
           mkdir -p "${TEMP_DIR}/tmp/local_packages"
 
           echo "📋 复制内核 deb 包..."
@@ -421,11 +470,6 @@ jobs:
 
           chmod 1777 "${TEMP_DIR}/tmp"
 
-          # ================================================================
-          # ★ 关键修复：在挂载 chroot 之前，从宿主机侧强制处理 resolv.conf
-          #   Bookworm 中 /etc/resolv.conf 是损坏的符号链接
-          #   必须在宿主机侧先删除再写入真实文件
-          # ================================================================
           echo "🔧 预修复 chroot 内的 resolv.conf（防止 Bookworm 符号链接问题）..."
           rm -f "${TEMP_DIR}/etc/resolv.conf"
           printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" \
@@ -439,12 +483,6 @@ jobs:
           mount --bind /sys "${TEMP_DIR}/sys"
           echo "✅ chroot 环境挂载完成"
 
-          # ================================================================
-          # ★ 核心修改：直接调用仓库中的 chroot.sh
-          #   路径: common-file/chroot.sh → 已复制到
-          #         ${TEMP_DIR}/tmp/local_packages/chroot.sh
-          #   在 chroot 内路径为: /tmp/local_packages/chroot.sh
-          # ================================================================
           echo ""
           echo "🚀 进入 chroot，调用 common-file/chroot.sh 执行系统重构..."
           chmod +x "${TEMP_DIR}/tmp/local_packages/chroot.sh"
@@ -492,7 +530,6 @@ jobs:
               echo "📦 安装 UFI001C 专属固件..."
               cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi001c.deb" "${BUILD_DIR_001C}/tmp/"
 
-              # 修复 UFI001C chroot 的 resolv.conf
               rm -f "${BUILD_DIR_001C}/etc/resolv.conf"
               printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" \
                 > "${BUILD_DIR_001C}/etc/resolv.conf"
@@ -508,7 +545,6 @@ jobs:
                 fi
                 echo "⚠️  固件安装第 ${i}/3 次重试..."
                 chroot "${BUILD_DIR_001C}" bash -c "apt-get --fix-broken install -y" || true
-                # 每次重试后修复 resolv.conf
                 rm -f "${BUILD_DIR_001C}/etc/resolv.conf"
                 printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" \
                   > "${BUILD_DIR_001C}/etc/resolv.conf"
@@ -549,7 +585,6 @@ jobs:
               echo "📦 安装 UFI003 专属固件..."
               cp "${SCRIPT_DIR}/firmware_debs/firmware-ufi003.deb" "${BUILD_DIR_003}/tmp/"
 
-              # 修复 UFI003 chroot 的 resolv.conf
               rm -f "${BUILD_DIR_003}/etc/resolv.conf"
               printf "nameserver 223.5.5.5\nnameserver 119.29.29.29\n" \
                 > "${BUILD_DIR_003}/etc/resolv.conf"
@@ -609,7 +644,6 @@ jobs:
           cat kernel_debs/Image.gz kernel_debs/msm8916-thwc-ufi001c.dtb > unified-kernel-dtb
           echo "✅ 内核 + DTB 合并完成 ($(du -sh unified-kernel-dtb | cut -f1))"
 
-          # 优先使用 ufi001c 的 initrd，仅选 ufi003 时用 ufi003 的
           INITRD_FILE="initrd_ufi001c.img"
           [[ "$TARGET" == "ufi003" ]] && INITRD_FILE="initrd_ufi003.img"
 
@@ -638,14 +672,16 @@ jobs:
         run: |
           echo "════════════════════════════════════════════════"
           echo "  打包目标设备: ${{ inputs.target_device }}"
+          echo "  内核类型: ${{ inputs.kernel_type }}"
           echo "════════════════════════════════════════════════"
           VERSION_NAME="${{ matrix.version }}"
           BUILD_TIME=$(date +%Y%m%d_%H%M%S)
           TARGET="${{ inputs.target_device }}"
+          KERNEL_TYPE="${{ inputs.kernel_type }}"
           cd output_dist
 
           if [[ "$TARGET" == "ufi001c" || "$TARGET" == "both" ]]; then
-            ARCHIVE_001C="Armbian_${VERSION_NAME}_ufi001c_server_${BUILD_TIME}.tar.gz"
+            ARCHIVE_001C="Armbian_${VERSION_NAME}_ufi001c_${KERNEL_TYPE}_${BUILD_TIME}.tar.gz"
             tar -czvf "${ARCHIVE_001C}" boot.img rootfs_ufi001c.img
             mv "${ARCHIVE_001C}" ..
             echo "UFI001C_ARCHIVE=${ARCHIVE_001C}" >> $GITHUB_ENV
@@ -653,7 +689,7 @@ jobs:
           fi
 
           if [[ "$TARGET" == "ufi003" || "$TARGET" == "both" ]]; then
-            ARCHIVE_003="Armbian_${VERSION_NAME}_ufi003_server_${BUILD_TIME}.tar.gz"
+            ARCHIVE_003="Armbian_${VERSION_NAME}_ufi003_${KERNEL_TYPE}_${BUILD_TIME}.tar.gz"
             tar -czvf "${ARCHIVE_003}" boot.img rootfs_ufi003.img
             mv "${ARCHIVE_003}" ..
             echo "UFI003_ARCHIVE=${ARCHIVE_003}" >> $GITHUB_ENV
@@ -669,7 +705,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "${{ needs.get-versions.outputs.tag_name }}"
-          name: "MSM8916 Armbian ${{ needs.get-versions.outputs.tag_name }} [${{ inputs.target_device }}]"
+          name: "MSM8916 Armbian ${{ needs.get-versions.outputs.tag_name }} [${{ inputs.target_device }}][${{ inputs.kernel_type }}]"
           body: |
             ## MSM8916 Armbian 固件
 
@@ -677,6 +713,7 @@ jobs:
             - **目标设备**: ${{ inputs.target_device }}
             - **Armbian 版本**: ${{ matrix.version }}
             - **内核来源**: 本仓库 `kernel_stable` Release
+            - **内核类型**: `${{ inputs.kernel_type }}`${{ inputs.kernel_type != 'normal' && ' ⚠️ 超频版本，请确认设备散热条件后再使用' || '' }}
 
             ## 文件说明
 
@@ -684,11 +721,11 @@ jobs:
             |---|---|
             | `boot.img` | 内核 + DTB + initrd，两款设备通用 |
             | `rootfs_ufi001c.img` | UFI001C 根文件系统 |
-            | `rootfs_ufi003.img` | UFI003 根文件系统 |
 
             ## 刷机后支持特性
             - ✅ DAE (eBPF 透明代理)
             - ✅ Docker 容器化
+            - ✅ BBR 拥塞控制 + CAKE 队列调度
 
           files: |
             ${{ env.UFI001C_ARCHIVE }}
