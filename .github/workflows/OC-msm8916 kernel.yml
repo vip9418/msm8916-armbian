@@ -31,6 +31,12 @@ on:
           - "1400"
           - "1600"
           - "1900"
+      # ✅ 新增：nomodem 裁剪选项
+      enable_nomodem:
+        description: "裁剪 Modem/GPS（释放约 88MB 内存，启用后 SIM 卡/LTE 失效）"
+        required: false
+        default: false
+        type: boolean
 
 env:
   TZ: Asia/Shanghai
@@ -286,7 +292,6 @@ jobs:
 
       - name: 应用 CPU 超频补丁（实验性）
         id: overclock
-        # ✅ 核心修复：fromJSON() 强制将 boolean 输入解析为真正的布尔值再比较
         if: ${{ fromJSON(inputs.enable_overclock) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
         env:
           TARGET_MHZ: ${{ inputs.overclock_freq }}
@@ -368,6 +373,181 @@ jobs:
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
+      # ✅ 新增步骤：运行时注入 nomodem 补丁
+      - name: 注入 No-Modem 补丁（裁剪 Modem/GPS，释放约 88MB 内存）
+        id: nomodem
+        if: ${{ fromJSON(inputs.enable_nomodem) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
+        env:
+          NOMODEM_SCRIPT: |
+            import re, sys, os, glob
+
+            DTS_DIR = "arch/arm64/boot/dts/qcom"
+            DEVICE_DTS = os.path.join(DTS_DIR, "msm8916-thwc-ufi001c.dts")
+
+            # ================================================================
+            # 第一步：在所有 msm8916*.dtsi 中动态扫描 modem 相关节点
+            # 需要找到的节点标签及其在 reserved-memory 中的单元地址
+            # ================================================================
+            MODEM_LABELS = {
+                # label         关键字（用于在文件中识别）
+                "mpss_mem":    ["mpss_mem", "mpss@"],
+                "mba_mem":     ["mba_mem",  "mba@"],
+                "wcnss_mem":   ["wcnss_mem","wcnss@"],
+                "rmtfs_mem":   ["rmtfs_mem","rmtfs@"],
+                "rfsa_mem":    ["rfsa_mem", "rfsa@"],
+            }
+
+            # 扫描所有相关 dtsi 文件，提取节点名（带单元地址）
+            found_nodes   = {}   # label -> "node-name@addr"
+            found_remotes = []   # remoteproc 节点 label（如 mpss, hexagon）
+
+            dtsi_files = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
+            dtsi_files += glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
+
+            for fpath in dtsi_files:
+                with open(fpath, "r") as f:
+                    content = f.read()
+
+                # 扫描 reserved-memory 中的 modem 节点（格式: label: name@addr）
+                for label, keywords in MODEM_LABELS.items():
+                    if label in found_nodes:
+                        continue
+                    for kw in keywords:
+                        # 匹配 "mpss_mem: mpss@86800000" 或 "mpss@86800000"
+                        pat = re.compile(
+                            r'(?:' + re.escape(label) + r'\s*:\s*)?'
+                            r'(' + re.escape(kw.rstrip('@')) + r'@[0-9a-fA-F]+)',
+                            re.IGNORECASE
+                        )
+                        m = pat.search(content)
+                        if m:
+                            found_nodes[label] = m.group(1)
+                            print(f"  [扫描] {label} → {m.group(1)} (in {os.path.basename(fpath)})")
+                            break
+
+                # 扫描 remoteproc 节点（mpss remoteproc，通常标签为 &mpss 或 hexagon）
+                rp_pat = re.compile(r'(mpss|hexagon)\s*:\s*(?:remoteproc|rproc)')
+                for m in rp_pat.finditer(content):
+                    lbl = m.group(1)
+                    if lbl not in found_remotes:
+                        found_remotes.append(lbl)
+                        print(f"  [扫描] remoteproc 节点标签: {lbl} (in {os.path.basename(fpath)})")
+
+            # ================================================================
+            # 第二步：构造追加到设备 DTS 末尾的 override 片段
+            # ================================================================
+            patch_lines = [
+                "",
+                "/*",
+                " * ============================================================",
+                " * nomodem patch - injected by CI workflow at build time",
+                " * 裁剪 Modem/GPS/WCNSS，释放约 88MB reserved-memory",
+                " * 启用后 SIM 卡 / LTE / GPS 功能完全停用",
+                " * ============================================================",
+                " */",
+                "/ {",
+                "\treserved-memory {",
+            ]
+
+            if found_nodes:
+                for label, node_name in found_nodes.items():
+                    patch_lines.append(f"\t\t/delete-node/ {node_name};")
+                    print(f"  [注入] /delete-node/ {node_name};")
+            else:
+                # 兜底：使用已知的主线地址（mainline kernel 6.x 标准布局）
+                print("  [警告] 未能动态扫描到节点地址，使用已知主线兜底地址")
+                fallback = [
+                    "/delete-node/ mpss@86800000;",
+                    "/delete-node/ mba@8ea00000;",
+                    "/delete-node/ wcnss@8b600000;",
+                    "/delete-node/ rmtfs@86700000;",
+                    "/delete-node/ rfsa@867e0000;",
+                ]
+                for line in fallback:
+                    patch_lines.append(f"\t\t{line}")
+                    print(f"  [兜底] {line}")
+
+            patch_lines += ["\t};", "};", ""]
+
+            # 禁用 remoteproc 节点
+            if found_remotes:
+                for lbl in found_remotes:
+                    patch_lines += [
+                        f"&{lbl} {{",
+                        "\tstatus = \"disabled\";",
+                        "};",
+                        "",
+                    ]
+                    print(f"  [注入] &{lbl} {{ status = \"disabled\"; }};")
+            else:
+                # 兜底：直接禁用 &mpss
+                patch_lines += [
+                    "&mpss {",
+                    "\tstatus = \"disabled\";",
+                    "};",
+                    "",
+                ]
+                print("  [兜底] &mpss { status = \"disabled\"; };")
+
+            # ================================================================
+            # 第三步：追加到设备 DTS 文件末尾
+            # ================================================================
+            with open(DEVICE_DTS, "r") as f:
+                original = f.read()
+
+            # 幂等检查：避免重复注入
+            if "nomodem patch - injected by CI" in original:
+                print("  [跳过] nomodem 补丁已存在，无需重复注入")
+                sys.exit(0)
+
+            with open(DEVICE_DTS, "a") as f:
+                f.write("\n".join(patch_lines))
+
+            print(f"\n✅ nomodem 补丁已追加到: {DEVICE_DTS}")
+
+            # ================================================================
+            # 第四步：打印注入后的末尾内容供日志核查
+            # ================================================================
+            with open(DEVICE_DTS, "r") as f:
+                lines = f.readlines()
+            print("\n=== 注入后 DTS 末尾 50 行 ===")
+            for line in lines[-50:]:
+                print(line, end="")
+        run: |
+          cd /builder/kernel
+
+          echo "════════════════════════════════════════════════"
+          echo "  注入 No-Modem 补丁"
+          echo "  目标文件: arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          echo "  预期释放: ~88MB reserved-memory"
+          echo "════════════════════════════════════════════════"
+
+          # 注入前确认设备 DTS 存在
+          DTS_FILE="arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          if [ ! -f "${DTS_FILE}" ]; then
+            echo "❌ 设备 DTS 不存在: ${DTS_FILE}"
+            echo "   现有 ufi 相关 DTS 文件:"
+            find arch/arm64/boot/dts/qcom/ -name "*ufi*" | head -10 || true
+            exit 1
+          fi
+
+          echo "注入前 modem 相关节点:"
+          grep -rn "mpss\|mba_mem\|wcnss\|rmtfs\|rfsa" \
+            arch/arm64/boot/dts/qcom/msm8916*.dtsi \
+            arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts \
+            2>/dev/null | grep -v "^Binary" | head -30 || true
+
+          echo ""
+          echo "🐍 运行 nomodem 注入脚本..."
+          printf '%s' "${NOMODEM_SCRIPT}" > /tmp/patch_nomodem.py
+          python3 /tmp/patch_nomodem.py
+
+          echo ""
+          echo "注入后验证（reserved-memory delete 指令）:"
+          grep -n "delete-node\|status.*disabled" "${DTS_FILE}" || true
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
       - name: 编译内核（Image.gz + DTB）
         id: compile
         if: ${{ steps.injectconfig.outputs.status == 'success' && !cancelled() }}
@@ -410,14 +590,24 @@ jobs:
 
           KERNEL_VER="${{ env.kernel_version }}"
 
-          # run: 脚本内插值后为字符串，== 'true' 在此处正确
+          # ✅ 后缀组合：超频 + nomodem 均可独立或叠加
+          # 例: 6.18.0.tar.gz
+          #     6.18.0-oc1600.tar.gz
+          #     6.18.0-nomodem.tar.gz
+          #     6.18.0-oc1600-nomodem.tar.gz
           if [ "${{ inputs.enable_overclock }}" == "true" ]; then
-            SUFFIX="-oc${{ inputs.overclock_freq }}"
+            OC_SUFFIX="-oc${{ inputs.overclock_freq }}"
           else
-            SUFFIX=""
+            OC_SUFFIX=""
           fi
 
-          PACKAGE_NAME="${KERNEL_VER}${SUFFIX}.tar.gz"
+          if [ "${{ inputs.enable_nomodem }}" == "true" ]; then
+            NM_SUFFIX="-nomodem"
+          else
+            NM_SUFFIX=""
+          fi
+
+          PACKAGE_NAME="${KERNEL_VER}${OC_SUFFIX}${NM_SUFFIX}.tar.gz"
           echo "📦 产物包名: ${PACKAGE_NAME}"
 
           cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
