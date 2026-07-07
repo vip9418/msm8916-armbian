@@ -1,0 +1,265 @@
+name: OC msm8916 extreme kernel
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: "Select kernel config"
+        required: false
+        default: "msm8916_defconfig"
+        type: choice
+        options:
+          - msm8916_defconfig
+          - defconfig
+      ccache_clear:
+        description: "Set whether to clear the cache"
+        required: false
+        default: false
+        type: boolean
+      enable_overclock:
+        description: "启用 CPU 超频（实验性，存在损坏设备风险）"
+        required: false
+        default: false
+        type: boolean
+      overclock_freq:
+        description: "超频目标频率 MHz"
+        required: false
+        default: "1400"
+        type: choice
+        options:
+          - "1400"
+          - "1600"
+          - "1800"
+          - "2000"
+          - "2100"
+      enable_nomodem:
+        description: "裁剪 Modem/GPS（释放约 88MB 内存，启用后 SIM 卡/LTE 失效）"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
+  KERNEL_BRANCH: msm8916/6.18
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: 初始化编译环境
+        id: init
+        run: |
+          sudo -E apt-get -y update
+          sudo -E apt-get -y install build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev dwarves fakeroot dpkg-dev debhelper rsync kmod cpio python3 git wget curl jq ccache libdw-dev cmake
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 创建虚拟磁盘扩展存储空间
+        id: disk
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 克隆内核源码
+        id: clone
+        run: |
+          cd /builder
+          git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
+          cd kernel
+          FULL_VERSION=$(grep -E "^VERSION =|^PATCHLEVEL =|^SUBLEVEL =" Makefile | awk '{print $3}' | tr '\n' '.' | sed 's/\.$//')
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 恢复 ccache 编译缓存
+        uses: actions/cache@v5
+        with:
+          path: /builder/kernel/.ccache
+          key: msm8916-${{ env.kernel_version }}-${{ github.sha }}
+          restore-keys: |
+            msm8916-${{ env.kernel_version }}-
+
+      - name: 加载并注入内核配置
+        id: injectconfig
+        run: |
+          cd /builder/kernel
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make ${{ inputs.kernel_config }}
+          
+          CFG="./scripts/config"
+          # DAE + Docker + BBR
+          $CFG --enable CONFIG_BPF --enable CONFIG_BPF_SYSCALL --enable CONFIG_BPF_JIT --enable CONFIG_CGROUPS
+          $CFG --enable CONFIG_DEBUG_INFO_BTF --enable CONFIG_IKCONFIG --enable CONFIG_IKCONFIG_PROC
+          $CFG --module CONFIG_TCP_CONG_BBR --module CONFIG_NET_SCH_CAKE --enable CONFIG_OVERLAY_FS
+          
+          make olddefconfig
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 应用 CPU 超频补丁（极端性能注入）
+        id: overclock
+        if: ${{ fromJSON(inputs.enable_overclock) == true && steps.injectconfig.outputs.status == 'success' }}
+        env:
+          TARGET_MHZ: ${{ inputs.overclock_freq }}
+          PATCH_SCRIPT: |
+            import re, sys, os, glob
+
+            DTS_DIR = "arch/arm64/boot/dts/qcom"
+            TARGET_MHZ = int(sys.argv[1])
+            TARGET_HZ = TARGET_MHZ * 1000000
+
+            # 极端超频档位表（Hz）
+            # 这里的电源域分配参考了酷安 2.1G 调优逻辑
+            OPP_LEVELS = [
+                (1324800000, "rpmpd_opp_turbo"),
+                (1401600000, "rpmpd_opp_turbo"),
+                (1497600000, "rpmpd_opp_super_turbo"), # 1.5G以上开启超电压模式
+                (1593600000, "rpmpd_opp_super_turbo"),
+                (1785600000, "rpmpd_opp_super_turbo"),
+                (1900800000, "rpmpd_opp_super_turbo"),
+                (2016000000, "rpmpd_opp_super_turbo"),
+                (2112000000, "rpmpd_opp_super_turbo"),
+            ]
+            levels = [(hz, pwr) for (hz, pwr) in OPP_LEVELS if hz <= TARGET_HZ + 1000000]
+
+            # 扫描 DTS 获取可用的电源域标签
+            dtsi_files = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi")) + glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
+            pwr_labels = set()
+            cpu_opp_file = None
+            cpu_opp_content = ""
+
+            for fpath in dtsi_files:
+                with open(fpath, "r") as f:
+                    content = f.read()
+                    if "998400000" in content:
+                        cpu_opp_file = fpath
+                        cpu_opp_content = content
+                    for m in re.finditer(r'(rpmpd_opp_\w+)\s*:', content):
+                        pwr_labels.add(m.group(1))
+
+            # 电源域降级逻辑（如果super_turbo没定义，回退到turbo）
+            def get_pwr(requested):
+                if requested in pwr_labels: return requested
+                return "rpmpd_opp_turbo" if "rpmpd_opp_turbo" in pwr_labels else "rpmpd_opp_nom"
+
+            # 定位 CPU 表
+            table_start = 0
+            start_m = re.search(r'(?:cpu_opp_table|opp-table)[^{]*\{', cpu_opp_content)
+            if start_m: table_start = start_m.start()
+            
+            # 括号计数找结尾
+            depth, table_end = 0, len(cpu_opp_content)
+            for i, ch in enumerate(cpu_opp_content[table_start:], start=table_start):
+                if ch == '{': depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        table_end = i + 1
+                        break
+
+            # 注入新条目
+            opp_block_pat = re.compile(r'\bopp-\d+\s*\{[^{}]*\};', re.DOTALL)
+            cpu_matches = list(opp_block_pat.finditer(cpu_opp_content[table_start:table_end]))
+            insert_pos = table_start + cpu_matches[-1].end()
+
+            if str(levels[0][0]) in cpu_opp_content:
+                print("Already patched.")
+                sys.exit(0)
+
+            insert_block = f"\n\t\t/* extreme overclock: target {TARGET_MHZ}MHz */\n"
+            for hz, pwr in levels:
+                p = get_pwr(pwr)
+                insert_block += f"\t\topp-{hz} {{\n\t\t\topp-hz = /bits/ 64 <{hz}>;\n\t\t\trequired-opps = <&{p}>;\n\t\t}};\n"
+
+            with open(cpu_opp_file, "w") as f:
+                f.write(cpu_opp_content[:insert_pos] + insert_block + cpu_opp_content[insert_pos:])
+            print(f"Successfully injected {len(levels)} levels to {cpu_opp_file}")
+        run: |
+          cd /builder/kernel
+          printf '%s' "${PATCH_SCRIPT}" > /tmp/patch_opp.py
+          python3 /tmp/patch_opp.py "${TARGET_MHZ}"
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 注入 No-Modem 补丁
+        id: nomodem
+        if: ${{ fromJSON(inputs.enable_nomodem) == true }}
+        env:
+          NOMODEM_SCRIPT: |
+            import re, os, glob
+            DTS_DIR = "arch/arm64/boot/dts/qcom"
+            DEVICE_DTS = os.path.join(DTS_DIR, "msm8916-thwc-ufi001c.dts")
+            RESERVED_MAP = {
+                "mpss@86800000": ["mpss@86800000", "mpss_mem"],
+                "mba@8ea00000": ["mba@8ea00000", "mba_mem"],
+                "wcnss@8b600000": ["wcnss@8b600000", "wcnss_mem"],
+                "rmtfs@86700000": ["rmtfs@86700000", "rmtfs_mem"],
+                "rfsa@867e0000": ["rfsa@867e0000", "rfsa_mem"]
+            }
+            # 扫描真实节点名
+            found = []
+            dtsi_files = glob.glob(os.path.join(DTS_DIR, "msm8916*.dts*"))
+            for fpath in dtsi_files:
+                with open(fpath, "r") as f:
+                    c = f.read()
+                    for k, v_list in RESERVED_MAP.items():
+                        for v in v_list:
+                            m = re.search(r'('+re.escape(v.split("@")[0])+r'@[0-9a-f]{6,})', c)
+                            if m: found.append(m.group(1))
+            
+            patch = "\n/* Step1: Delete remoteproc */\n/delete-node/ &mpss;\n/delete-node/ &wcnss;\n"
+            patch += "\n/* Step2: Delete reserved memory */\n/ {\n\treserved-memory {\n"
+            for node in set(found if found else RESERVED_MAP.keys()):
+                patch += f"\t\t/delete-node/ {node};\n"
+            patch += "\t};\n};\n"
+            
+            with open(DEVICE_DTS, "a") as f: f.write(patch)
+        run: |
+          cd /builder/kernel
+          python3 -c "${NOMODEM_SCRIPT}"
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 编译内核
+        run: |
+          cd /builder/kernel
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          make -j$(nproc) Image.gz dtbs
+          make -j$(nproc) bindeb-pkg LOCALVERSION=-msm8916
+
+      - name: 打包产物
+        id: package
+        run: |
+          cd /builder
+          mkdir -p pkg
+          cp kernel/arch/arm64/boot/Image.gz pkg/
+          cp kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb pkg/
+          cp *.deb pkg/
+          
+          OC_SUFF="${{ inputs.enable_overclock == true && format('-oc{0}', inputs.overclock_freq) || '' }}"
+          NM_SUFF="${{ inputs.enable_nomodem == true && '-nomodem' || '' }}"
+          PKG_NAME="${{ env.kernel_version }}${OC_SUFF}${NM_SUFF}.tar.gz"
+          
+          cd pkg && tar -czf "../${PKG_NAME}" .
+          echo "package_path=/builder/${PKG_NAME}" >> $GITHUB_ENV
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 上传 Release
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: kernel_stable
+          artifacts: ${{ env.package_path }}
+          allow_updates: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
