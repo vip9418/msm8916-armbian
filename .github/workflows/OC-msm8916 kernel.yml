@@ -409,6 +409,16 @@ jobs:
 
           KERNEL_VER="${{ env.kernel_version }}"
 
+          # ✅ 根据是否超频生成带标识的文件名后缀
+          if [ "${{ inputs.enable_overclock }}" == "true" ]; then
+            SUFFIX="-oc${{ inputs.overclock_freq }}"
+          else
+            SUFFIX=""
+          fi
+
+          PACKAGE_NAME="${KERNEL_VER}${SUFFIX}.tar.gz"
+          echo "📦 产物包名: ${PACKAGE_NAME}"
+
           cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
           cp /builder/kernel/arch/arm64/boot/Image.gz ./
 
@@ -426,14 +436,14 @@ jobs:
             [ -f "$f" ] || { echo "缺少文件: $f"; exit 1; }
           done
 
-          tar -czf "${KERNEL_VER}.tar.gz" \
+          tar -czf "${PACKAGE_NAME}" \
             msm8916-thwc-ufi001c.dtb \
             Image.gz \
             linux-headers.deb \
             linux-image.deb
 
-          echo "package_path=/builder/kernel_package/${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
-          echo "package_name=${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
+          echo "package_path=/builder/kernel_package/${PACKAGE_NAME}" >> ${GITHUB_ENV}
+          echo "package_name=${PACKAGE_NAME}" >> ${GITHUB_ENV}
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 上传内核到 Release
