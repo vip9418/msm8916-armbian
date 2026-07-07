@@ -1,0 +1,657 @@
+name: Compile msm8916 kernel
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      kernel_config:
+        description: "Select kernel config"
+        required: false
+        default: "msm8916_defconfig"
+        type: choice
+        options:
+          - msm8916_defconfig
+          - defconfig
+      ccache_clear:
+        description: "Set whether to clear the cache"
+        required: false
+        default: false
+        type: boolean
+      enable_overclock:
+        description: "⚡ 启用 CPU 超频（实验性，存在损坏设备风险）"
+        required: false
+        default: false
+        type: boolean
+      overclock_freq:
+        description: "超频目标频率（仅 enable_overclock=true 时生效）"
+        required: false
+        default: "1400"
+        type: choice
+        options:
+          - "1400"
+          - "1600"
+          - "1900"
+
+env:
+  TZ: Asia/Shanghai
+  KERNEL_REPO: Crychic-Band/kernel_ufi_msm8916
+  KERNEL_BRANCH: msm8916/6.18
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      # ── 步骤 1 ──────────────────────────────────────────────
+      - name: 🛠️ 初始化编译环境
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev dwarves fakeroot dpkg-dev debhelper rsync kmod cpio python3 git wget curl jq ccache libdw-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo -E timedatectl set-timezone "${TZ:-Asia/Shanghai}"
+          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo -E timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 2 ──────────────────────────────────────────────
+      - name: 💾 创建虚拟磁盘扩展存储空间
+        id: disk
+        run: |
+          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
+          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
+          sudo truncate -s "${root_size}"G /root.img
+          sudo losetup /dev/loop6 /mnt/mnt.img
+          sudo losetup /dev/loop7 /root.img
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
+          sudo vgcreate github /dev/loop6 /dev/loop7
+          sudo lvcreate -n runner -l 100%FREE github
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 /dev/github/runner
+          sudo mkdir -p /builder
+          sudo mount /dev/github/runner /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 3 ──────────────────────────────────────────────
+      - name: 📥 克隆内核源码（分支 ${{ env.KERNEL_BRANCH }}）
+        id: clone
+        run: |
+          cd /builder
+          echo "正在克隆内核源码..."
+          echo "仓库: https://github.com/${{ env.KERNEL_REPO }}"
+          echo "分支: ${{ env.KERNEL_BRANCH }}"
+
+          git clone \
+            --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            https://github.com/${{ env.KERNEL_REPO }}.git kernel
+
+          cd kernel
+
+          KERNEL_VERSION=$(grep -E "^VERSION = " Makefile | awk '{print $3}')
+          KERNEL_PATCHLEVEL=$(grep -E "^PATCHLEVEL = " Makefile | awk '{print $3}')
+          KERNEL_SUBLEVEL=$(grep -E "^SUBLEVEL = " Makefile | awk '{print $3}')
+          FULL_VERSION="${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}"
+
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_ENV}
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "✅ 内核版本: ${FULL_VERSION}"
+
+          echo ""
+          echo "════ 验证 defconfig 文件存在性 ════"
+          ls -la arch/arm64/configs/ | grep defconfig || true
+          if [ -f "arch/arm64/configs/msm8916_defconfig" ]; then
+            echo "✅ arch/arm64/configs/msm8916_defconfig 确认存在"
+          else
+            echo "❌ 错误: msm8916_defconfig 不存在于当前分支!"
+            exit 1
+          fi
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 4 ──────────────────────────────────────────────
+      - name: 📦 恢复 ccache 编译缓存
+        uses: actions/cache@v5
+        with:
+          path: /builder/kernel/.ccache
+          key: msm8916-${{ env.kernel_version }}-${{ github.sha }}
+          restore-keys: |
+            msm8916-${{ env.kernel_version }}-
+
+      # ── 步骤 5 ──────────────────────────────────────────────
+      - name: ⚙️ 加载基础 defconfig
+        id: loadconfig
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+
+          export CCACHE_DIR=/builder/kernel/.ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 5G
+          [[ "${{ inputs.ccache_clear }}" == "true" ]] && ccache -C
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          REQUESTED_CONFIG="${{ inputs.kernel_config }}"
+          echo "加载基础配置: ${REQUESTED_CONFIG}"
+
+          if [ -f "arch/arm64/configs/${REQUESTED_CONFIG}" ]; then
+            echo "✅ 确认配置文件存在: arch/arm64/configs/${REQUESTED_CONFIG}"
+            make ${REQUESTED_CONFIG}
+          else
+            echo "⚠️  未找到 ${REQUESTED_CONFIG}，自动回退到 defconfig"
+            make defconfig
+          fi
+
+          echo "✅ 基础 .config 已生成"
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 6 ──────────────────────────────────────────────
+      - name: 🔧 注入 DAE + Docker + BBR 内核配置项（v4）
+        id: injectconfig
+        if: ${{ steps.loadconfig.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+          export ARCH=arm64
+          CFG="./scripts/config"
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  [1/4] DAE 官方必须项 + SOCK_OPS 完整支持               ║"
+          echo "║  来源: github.com/daeuniverse/dae 官方 README            ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # ── DAE 官方文档全部必须项（逐字对应）──
+          $CFG --enable  CONFIG_BPF
+          $CFG --enable  CONFIG_BPF_SYSCALL
+          $CFG --enable  CONFIG_BPF_JIT
+          $CFG --enable  CONFIG_BPF_JIT_ALWAYS_ON
+          $CFG --enable  CONFIG_CGROUPS
+          $CFG --enable  CONFIG_KPROBES
+          $CFG --enable  CONFIG_NET_INGRESS
+          $CFG --enable  CONFIG_NET_EGRESS
+          $CFG --module  CONFIG_NET_SCH_INGRESS
+          $CFG --module  CONFIG_NET_CLS_BPF
+          $CFG --enable  CONFIG_NET_CLS_ACT
+          $CFG --enable  CONFIG_BPF_STREAM_PARSER
+          $CFG --enable  CONFIG_DEBUG_INFO
+          $CFG --disable CONFIG_DEBUG_INFO_REDUCED
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF
+          $CFG --enable  CONFIG_KPROBE_EVENTS
+          $CFG --enable  CONFIG_BPF_EVENTS
+          $CFG --enable  CONFIG_CGROUP_BPF
+
+          # ── SOCK_OPS 完整支持（修复 daed bpf_get_current_task 崩溃）──
+          $CFG --enable  CONFIG_SOCK_CGROUP_DATA
+          $CFG --enable  CONFIG_CGROUP_NET_CLASSID
+          $CFG --enable  CONFIG_CGROUP_NET_PRIO
+
+          # ── BTF 增强（CO-RE 可移植性）──
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF_MODULES
+
+          # ── ikconfig（运行时读取 /proc/config.gz）──
+          $CFG --enable  CONFIG_IKCONFIG
+          $CFG --enable  CONFIG_IKCONFIG_PROC
+
+          # ── XDP 支持（dae 高性能数据路径）──
+          $CFG --enable  CONFIG_XDP_SOCKETS
+          $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
+
+          # ── Tracing（仅静态部分，不含 DYNAMIC_FTRACE 防止变砖）──
+          $CFG --enable  CONFIG_TRACEPOINTS
+          $CFG --enable  CONFIG_UPROBE_EVENTS
+          # ★ 不启用 CONFIG_FTRACE / CONFIG_DYNAMIC_FTRACE（MSM8916 变砖风险）
+          # ★ 不启用 CONFIG_BPF_LSM（需 bootloader 传参，MSM8916 不支持）
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  [2/4] BBR + CAKE 网络加速                              ║"
+          echo "║  BBR: 高性能拥塞控制  CAKE: 网关专用队列调度器           ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # ── BBR 拥塞控制 ──
+          $CFG --enable  CONFIG_TCP_CONG_ADVANCED
+          $CFG --module  CONFIG_TCP_CONG_BBR
+
+          # ── CAKE 队列调度器（首选，专为路由器/网关设计）──
+          # 不做 pacing，Docker 多流并发正常，与 DAE 代理配合最佳
+          $CFG --module  CONFIG_NET_SCH_CAKE
+
+          # ── FQ / FQ_CODEL 保留备用 ──
+          $CFG --module  CONFIG_NET_SCH_FQ
+          $CFG --module  CONFIG_NET_SCH_FQ_CODEL
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  [3/4] Docker 官方必须项                                 ║"
+          echo "║  来源: github.com/docker/docker/contrib/check-config.sh  ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # 命名空间
+          $CFG --enable  CONFIG_NAMESPACES
+          $CFG --enable  CONFIG_NET_NS
+          $CFG --enable  CONFIG_PID_NS
+          $CFG --enable  CONFIG_IPC_NS
+          $CFG --enable  CONFIG_UTS_NS
+          $CFG --enable  CONFIG_USER_NS
+
+          # Cgroup
+          $CFG --enable  CONFIG_CGROUP_CPUACCT
+          $CFG --enable  CONFIG_CGROUP_DEVICE
+          $CFG --enable  CONFIG_CGROUP_FREEZER
+          $CFG --enable  CONFIG_CGROUP_SCHED
+          $CFG --enable  CONFIG_CPUSETS
+          $CFG --enable  CONFIG_MEMCG
+          $CFG --enable  CONFIG_MEMCG_SWAP
+          $CFG --enable  CONFIG_KEYS
+          $CFG --enable  CONFIG_BLK_CGROUP
+          $CFG --enable  CONFIG_BLK_DEV_THROTTLING
+          $CFG --enable  CONFIG_CGROUP_PERF
+          $CFG --enable  CONFIG_CGROUP_HUGETLB
+          $CFG --enable  CONFIG_CFS_BANDWIDTH
+          $CFG --enable  CONFIG_FAIR_GROUP_SCHED
+
+          # 网络虚拟化
+          $CFG --module  CONFIG_VETH
+          $CFG --module  CONFIG_BRIDGE
+          $CFG --enable  CONFIG_BRIDGE_NETFILTER
+          $CFG --enable  CONFIG_DUMMY
+
+          # Netfilter
+          $CFG --enable  CONFIG_NETFILTER
+          $CFG --enable  CONFIG_NF_CONNTRACK
+          $CFG --module  CONFIG_NF_NAT
+          $CFG --module  CONFIG_IP_NF_IPTABLES
+          $CFG --module  CONFIG_IP_NF_FILTER
+          $CFG --module  CONFIG_IP_NF_MANGLE
+          $CFG --module  CONFIG_IP_NF_TARGET_MASQUERADE
+          $CFG --module  CONFIG_IP_NF_NAT
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_CONNTRACK
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_IPVS
+          $CFG --module  CONFIG_NETFILTER_XT_MARK
+
+          # IPVS
+          $CFG --enable  CONFIG_IP_VS
+          $CFG --enable  CONFIG_IP_VS_NFCT
+          $CFG --enable  CONFIG_IP_VS_PROTO_TCP
+          $CFG --enable  CONFIG_IP_VS_PROTO_UDP
+          $CFG --enable  CONFIG_IP_VS_RR
+
+          # Overlay FS
+          $CFG --module  CONFIG_OVERLAY_FS
+
+          # 其他
+          $CFG --enable  CONFIG_POSIX_MQUEUE
+          $CFG --module  CONFIG_TUN
+          $CFG --enable  CONFIG_SECCOMP
+          $CFG --enable  CONFIG_SECCOMP_FILTER
+          $CFG --enable  CONFIG_EXT4_FS
+          $CFG --enable  CONFIG_EXT4_FS_POSIX_ACL
+          $CFG --enable  CONFIG_EXT4_FS_SECURITY
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  [4/4] make olddefconfig 解决依赖关系                    ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+          make olddefconfig
+
+          echo ""
+          echo "════════════════ ✅ 关键配置验证 ════════════════"
+
+          echo "--- DAE 必须项 ---"
+          for key in CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
+                     CONFIG_BPF_JIT_ALWAYS_ON CONFIG_CGROUPS CONFIG_KPROBES \
+                     CONFIG_NET_INGRESS CONFIG_NET_EGRESS \
+                     CONFIG_NET_SCH_INGRESS CONFIG_NET_CLS_BPF \
+                     CONFIG_NET_CLS_ACT CONFIG_BPF_STREAM_PARSER \
+                     CONFIG_DEBUG_INFO CONFIG_DEBUG_INFO_BTF \
+                     CONFIG_KPROBE_EVENTS CONFIG_BPF_EVENTS CONFIG_CGROUP_BPF; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          grep "CONFIG_DEBUG_INFO_REDUCED" .config \
+            && echo "  ⚠️  CONFIG_DEBUG_INFO_REDUCED 存在！" \
+            || echo "  ✅ CONFIG_DEBUG_INFO_REDUCED=not set (正确)"
+
+          echo ""
+          echo "--- SOCK_OPS（daed 崩溃修复）---"
+          for key in CONFIG_BPF_STREAM_PARSER CONFIG_SOCK_CGROUP_DATA \
+                     CONFIG_CGROUP_NET_CLASSID CONFIG_CGROUP_NET_PRIO; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo ""
+          echo "--- BBR + CAKE 网络加速 ---"
+          for key in CONFIG_TCP_CONG_ADVANCED CONFIG_TCP_CONG_BBR \
+                     CONFIG_NET_SCH_CAKE CONFIG_NET_SCH_FQ \
+                     CONFIG_NET_SCH_FQ_CODEL; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo ""
+          echo "--- 安全排除项（防止变砖）---"
+          grep "^CONFIG_BPF_LSM=" .config \
+            && echo "  ⚠️  CONFIG_BPF_LSM 存在，可能导致变砖！" \
+            || echo "  ✅ CONFIG_BPF_LSM 未启用（安全）"
+          grep "^CONFIG_DYNAMIC_FTRACE=" .config \
+            && echo "  ⚠️  CONFIG_DYNAMIC_FTRACE 存在，可能导致变砖！" \
+            || echo "  ✅ CONFIG_DYNAMIC_FTRACE 未启用（安全）"
+
+          echo ""
+          echo "--- Docker 关键项 ---"
+          for key in CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_PID_NS \
+                     CONFIG_MEMCG CONFIG_OVERLAY_FS CONFIG_VETH \
+                     CONFIG_BRIDGE CONFIG_NF_NAT CONFIG_SECCOMP \
+                     CONFIG_CGROUP_FREEZER CONFIG_KEYS; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo ""
+          echo "--- ikconfig ---"
+          for key in CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          echo "════════════════════════════════════════════════"
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 7 ──────────────────────────────────────────────
+      - name: ⚡ 应用 CPU 超频补丁（实验性，仅 enable_overclock=true 时执行）
+        id: overclock
+        if: ${{ inputs.enable_overclock == 'true' && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+
+          TARGET_MHZ="${{ inputs.overclock_freq }}"
+          TARGET_HZ="${TARGET_MHZ}000000"
+
+          echo ""
+          echo "╔══════════════════════════════════════════════════════════╗"
+          echo "║  ⚡ CPU 超频补丁                                         ║"
+          echo "║  目标频率: ${TARGET_MHZ} MHz                             ║"
+          echo "║  ⚠️  警告: 实验性功能，存在损坏设备风险！               ║"
+          echo "║  MSM8916 原厂最高: 1200 MHz                              ║"
+          echo "║  无散热设备强烈建议不超过 1400 MHz                       ║"
+          echo "╚══════════════════════════════════════════════════════════╝"
+
+          # ── 查找 DTS 文件 ──
+          DTS_CANDIDATES=(
+            "arch/arm64/boot/dts/qcom/msm8916.dtsi"
+            "arch/arm64/boot/dts/qcom/msm8916-ufi.dtsi"
+            "arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          )
+
+          DTS_FILE=""
+          for f in "${DTS_CANDIDATES[@]}"; do
+            if [ -f "$f" ]; then
+              DTS_FILE="$f"
+              echo "✅ 找到 DTS 文件: ${DTS_FILE}"
+              break
+            fi
+          done
+
+          if [ -z "${DTS_FILE}" ]; then
+            echo "❌ 错误: 未找到任何 DTS 文件，查找路径:"
+            for f in "${DTS_CANDIDATES[@]}"; do
+              echo "  - $f"
+            done
+            echo ""
+            echo "实际存在的 DTS 文件:"
+            find arch/arm64/boot/dts/qcom/ -name "*.dtsi" -o -name "*.dts" \
+              | grep -i "msm8916\|ufi" | head -20 || true
+            exit 1
+          fi
+
+          # ── 显示当前 OPP 配置 ──
+          echo ""
+          echo "════ 当前 OPP 频率配置 ════"
+          grep -n "opp-hz\|opp-microvolt\|opp-[0-9]" "${DTS_FILE}" \
+            | head -40 || echo "（未找到 OPP 配置）"
+
+          # ── 应用超频补丁 ──
+          python3 << PYEOF
+import re
+import sys
+
+dts_path = "${DTS_FILE}"
+target_mhz = int("${TARGET_MHZ}")
+target_hz  = target_mhz * 1_000_000
+
+# 根据目标频率决定插入哪些档位
+# 电压参考值（实验性，不保证稳定）
+opp_levels = []
+
+if target_mhz >= 1400:
+    opp_levels.append((1_400_000_000, 1_200_000))
+if target_mhz >= 1600:
+    opp_levels.append((1_600_000_000, 1_225_000))
+if target_mhz >= 1900:
+    opp_levels.append((1_900_000_000, 1_250_000))
+
+with open(dts_path, "r") as f:
+    content = f.read()
+
+# 检查是否已经存在超频档位
+if "1400000000" in content or "1600000000" in content or "1900000000" in content:
+    print("⚠️  检测到已存在超频档位，跳过重复插入")
+    sys.exit(0)
+
+# 构建要插入的 OPP 条目
+insert_text = "\n\t\t/* ⚡ 超频档位 - 实验性，目标: {}MHz */\n".format(target_mhz)
+for hz, uv in opp_levels:
+    mhz = hz // 1_000_000
+    insert_text += """\t\topp-{hz} {{
+\t\t\topp-hz = /bits/ 64 <{hz}>;
+\t\t\topp-microvolt = <{uv}>;
+\t\t\tturbo-mode;
+\t\t}};
+""".format(hz=hz, uv=uv)
+
+# 策略1：在最后一个 opp-XXXXXXXXX { 块之后插入
+# 匹配格式: opp-数字 { ... };
+opp_pattern = re.compile(
+    r'(opp-\d+\s*\{[^}]*opp-hz\s*=[^}]*\};)',
+    re.DOTALL
+)
+matches = list(opp_pattern.finditer(content))
+
+if matches:
+    last_match = matches[-1]
+    insert_pos = last_match.end()
+    new_content = content[:insert_pos] + "\n" + insert_text + content[insert_pos:]
+    with open(dts_path, "w") as f:
+        f.write(new_content)
+    print("✅ 超频 OPP 条目已插入（策略1: 最后 OPP 块之后）")
+    print("   插入档位:")
+    for hz, uv in opp_levels:
+        print("   - {}MHz @ {}mV".format(hz // 1_000_000, uv // 1000))
+else:
+    print("⚠️  策略1失败：未找到标准 OPP 块格式")
+    print("   尝试策略2：搜索 cpu-opp-table 或 opp-table")
+
+    # 策略2：在 opp-table 结束符前插入
+    table_end = re.search(r'(cpu[_-]opp[_-]table[^{]*\{)', content)
+    if table_end:
+        # 找到对应的结束括号
+        start = table_end.start()
+        depth = 0
+        pos = content.find('{', start)
+        while pos < len(content):
+            if content[pos] == '{':
+                depth += 1
+            elif content[pos] == '}':
+                depth -= 1
+                if depth == 0:
+                    # 在结束括号前插入
+                    new_content = content[:pos] + insert_text + content[pos:]
+                    with open(dts_path, "w") as f:
+                        f.write(new_content)
+                    print("✅ 超频 OPP 条目已插入（策略2: opp-table 结束前）")
+                    break
+            pos += 1
+    else:
+        print("❌ 两种策略均失败，请手动检查 DTS 文件格式")
+        print("   DTS 文件: {}".format(dts_path))
+        sys.exit(1)
+PYEOF
+
+          # ── 验证补丁结果 ──
+          echo ""
+          echo "════ 验证超频补丁结果 ════"
+          echo "插入的频率档位："
+          grep -n "1[469][0-9][0-9]000000\|turbo-mode" "${DTS_FILE}" || \
+            echo "⚠️  未找到超频档位，请检查日志"
+
+          echo ""
+          echo "修改后完整 OPP 表："
+          grep -n "opp-hz\|opp-microvolt\|turbo-mode\|opp-[0-9]" "${DTS_FILE}" \
+            | head -60 || true
+
+          echo ""
+          echo "⚠️  超频风险提示："
+          echo "  - MSM8916 原厂最高频率: 1200 MHz"
+          echo "  - UFI001C 无散热，长期高频可能过热"
+          echo "  - 建议监控温度: cat /sys/class/thermal/thermal_zone*/temp"
+          echo "  - 超过 75°C 建议立即降频或关机"
+          echo "  - 1400 MHz 相对安全，1600/1900 MHz 风险较高"
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 8 ──────────────────────────────────────────────
+      - name: 🔨 编译内核（Image.gz + DTB）
+        id: compile
+        if: ${{ steps.injectconfig.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+
+          export CCACHE_DIR=/builder/kernel/.ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export DTC_FLAGS="-@"
+
+          make -j$(nproc) Image.gz dtbs
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 9 ──────────────────────────────────────────────
+      - name: 📦 打包 deb 安装包
+        id: debpkg
+        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          make -j$(nproc) bindeb-pkg \
+            LOCALVERSION=-msm8916 \
+            KDEB_PKGVERSION=${{ env.kernel_version }}-1 \
+            KDEB_SOURCENAME=linux-msm8916
+
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 10 ──────────────────────────────────────────────
+      - name: 📋 收集编译产物并打包
+        id: package
+        if: ${{ steps.debpkg.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder
+          mkdir -p kernel_package
+          cd kernel_package
+
+          KERNEL_VER="${{ env.kernel_version }}"
+
+          cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
+          cp /builder/kernel/arch/arm64/boot/Image.gz ./
+
+          find /builder -maxdepth 1 \
+            -name "linux-headers-*${KERNEL_VER}*.deb" ! -name "*dbg*" \
+            -type f -exec cp {} ./linux-headers.deb \;
+          find /builder -maxdepth 1 \
+            -name "linux-image-*${KERNEL_VER}*.deb" ! -name "*dbg*" \
+            -type f -exec cp {} ./linux-image.deb \;
+
+          echo "=== Package contents ==="
+          ls -la ./
+
+          for f in msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: Missing file: $f"
+              exit 1
+            fi
+          done
+
+          tar -czf "${KERNEL_VER}.tar.gz" \
+            msm8916-thwc-ufi001c.dtb \
+            Image.gz \
+            linux-headers.deb \
+            linux-image.deb
+
+          echo "package_path=/builder/kernel_package/${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
+          echo "package_name=${KERNEL_VER}.tar.gz" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      # ── 步骤 11 ──────────────────────────────────────────────
+      - name: 🚀 上传内核到 Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
+        with:
+          tag: kernel_stable
+          artifacts: ${{ env.package_path }}
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## MSM8916 主线 LTS 内核
+
+            - **内核版本**: ${{ env.kernel_version }}
+            - **超频状态**: ${{ inputs.enable_overclock == 'true' && format('⚡ 已启用 {0}MHz', inputs.overclock_freq) || '✅ 标准频率（1200MHz）' }}
+
+            ## 支持特性
+            - ✅ DAE (eBPF 透明代理) 完整支持
+            - ✅ SOCK_OPS / BPF_STREAM_PARSER（daed 面板）
+            - ✅ Docker 容器化完整支持
+            - ✅ BTF + CO-RE（eBPF 可移植性）
+            - ✅ BBR 拥塞控制算法
+            - ✅ CAKE 队列调度器（解决 Docker 拉取卡顿）
+            - ✅ ikconfig（运行时内核配置自检）
+
+            ## 刷机后验证
+            ```bash
+            # 验证 BBR + CAKE
+            sysctl net.ipv4.tcp_congestion_control
+            sysctl net.core.default_qdisc
+
+            # 验证超频（如已启用）
+            cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+
+            # 监控温度
+            cat /sys/class/thermal/thermal_zone*/temp
+            ```
