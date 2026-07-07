@@ -1,4 +1,4 @@
-name: OC msm8916 extreme kernel
+name: OC- msm8916 kernel
 
 on:
   repository_dispatch:
@@ -51,9 +51,25 @@ jobs:
     steps:
       - name: 初始化编译环境
         id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
           sudo -E apt-get -y update
-          sudo -E apt-get -y install build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev dwarves fakeroot dpkg-dev debhelper rsync kmod cpio python3 git wget curl jq ccache libdw-dev cmake
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install build-essential bc bison flex libssl-dev libncurses5-dev libelf-dev dwarves fakeroot dpkg-dev debhelper rsync kmod cpio python3 git wget curl jq ccache libdw-dev
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo -E timedatectl set-timezone "${TZ:-Asia/Shanghai}"
+          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo -E timedatectl set-ntp true
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 创建虚拟磁盘扩展存储空间
@@ -65,23 +81,41 @@ jobs:
           sudo truncate -s "${root_size}"G /root.img
           sudo losetup /dev/loop6 /mnt/mnt.img
           sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6 /dev/loop7
+          sudo pvcreate /dev/loop6
+          sudo pvcreate /dev/loop7
           sudo vgcreate github /dev/loop6 /dev/loop7
           sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs -f /dev/github/runner
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 /dev/github/runner
           sudo mkdir -p /builder
           sudo mount /dev/github/runner /builder
           sudo chown -R runner:runner /builder
+          df -Th
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 克隆内核源码
         id: clone
         run: |
           cd /builder
-          git clone --depth=1 --branch ${{ env.KERNEL_BRANCH }} https://github.com/${{ env.KERNEL_REPO }}.git kernel
+          echo "仓库: https://github.com/${{ env.KERNEL_REPO }}"
+          echo "分支: ${{ env.KERNEL_BRANCH }}"
+          git clone \
+            --depth=1 \
+            --branch ${{ env.KERNEL_BRANCH }} \
+            https://github.com/${{ env.KERNEL_REPO }}.git kernel
           cd kernel
-          FULL_VERSION=$(grep -E "^VERSION =|^PATCHLEVEL =|^SUBLEVEL =" Makefile | awk '{print $3}' | tr '\n' '.' | sed 's/\.$//')
+          KERNEL_VERSION=$(grep -E "^VERSION = " Makefile | awk '{print $3}')
+          KERNEL_PATCHLEVEL=$(grep -E "^PATCHLEVEL = " Makefile | awk '{print $3}')
+          KERNEL_SUBLEVEL=$(grep -E "^SUBLEVEL = " Makefile | awk '{print $3}')
+          FULL_VERSION="${KERNEL_VERSION}.${KERNEL_PATCHLEVEL}.${KERNEL_SUBLEVEL}"
           echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_ENV}
+          echo "kernel_version=${FULL_VERSION}" >> ${GITHUB_OUTPUT}
+          echo "内核版本: ${FULL_VERSION}"
+          if [ -f "arch/arm64/configs/msm8916_defconfig" ]; then
+            echo "msm8916_defconfig 确认存在"
+          else
+            echo "错误: msm8916_defconfig 不存在"
+            exit 1
+          fi
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 恢复 ccache 编译缓存
@@ -92,174 +126,671 @@ jobs:
           restore-keys: |
             msm8916-${{ env.kernel_version }}-
 
-      - name: 加载并注入内核配置
+      - name: 加载基础 defconfig
+        id: loadconfig
+        if: ${{ steps.disk.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+          export CCACHE_DIR=/builder/kernel/.ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          ccache -M 5G
+          [[ "${{ inputs.ccache_clear }}" == "true" ]] && ccache -C
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          REQUESTED_CONFIG="${{ inputs.kernel_config }}"
+          if [ -f "arch/arm64/configs/${REQUESTED_CONFIG}" ]; then
+            make ${REQUESTED_CONFIG}
+          else
+            echo "未找到 ${REQUESTED_CONFIG}，回退到 defconfig"
+            make defconfig
+          fi
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 注入 DAE + Docker + BBR 内核配置项
         id: injectconfig
+        if: ${{ steps.loadconfig.outputs.status == 'success' && !cancelled() }}
         run: |
           cd /builder/kernel
           export ARCH=arm64
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          make ${{ inputs.kernel_config }}
-          
           CFG="./scripts/config"
-          # DAE + Docker + BBR
-          $CFG --enable CONFIG_BPF --enable CONFIG_BPF_SYSCALL --enable CONFIG_BPF_JIT --enable CONFIG_CGROUPS
-          $CFG --enable CONFIG_DEBUG_INFO_BTF --enable CONFIG_IKCONFIG --enable CONFIG_IKCONFIG_PROC
-          $CFG --module CONFIG_TCP_CONG_BBR --module CONFIG_NET_SCH_CAKE --enable CONFIG_OVERLAY_FS
-          
+
+          echo "=== [1/4] DAE 官方必须项 + SOCK_OPS ==="
+          $CFG --enable  CONFIG_BPF
+          $CFG --enable  CONFIG_BPF_SYSCALL
+          $CFG --enable  CONFIG_BPF_JIT
+          $CFG --enable  CONFIG_BPF_JIT_ALWAYS_ON
+          $CFG --enable  CONFIG_CGROUPS
+          $CFG --enable  CONFIG_KPROBES
+          $CFG --enable  CONFIG_NET_INGRESS
+          $CFG --enable  CONFIG_NET_EGRESS
+          $CFG --module  CONFIG_NET_SCH_INGRESS
+          $CFG --module  CONFIG_NET_CLS_BPF
+          $CFG --enable  CONFIG_NET_CLS_ACT
+          $CFG --enable  CONFIG_BPF_STREAM_PARSER
+          $CFG --enable  CONFIG_DEBUG_INFO
+          $CFG --disable CONFIG_DEBUG_INFO_REDUCED
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF
+          $CFG --enable  CONFIG_KPROBE_EVENTS
+          $CFG --enable  CONFIG_BPF_EVENTS
+          $CFG --enable  CONFIG_CGROUP_BPF
+          $CFG --enable  CONFIG_SOCK_CGROUP_DATA
+          $CFG --enable  CONFIG_CGROUP_NET_CLASSID
+          $CFG --enable  CONFIG_CGROUP_NET_PRIO
+          $CFG --enable  CONFIG_DEBUG_INFO_BTF_MODULES
+          $CFG --enable  CONFIG_IKCONFIG
+          $CFG --enable  CONFIG_IKCONFIG_PROC
+          $CFG --enable  CONFIG_XDP_SOCKETS
+          $CFG --enable  CONFIG_XDP_SOCKETS_DIAG
+          $CFG --enable  CONFIG_TRACEPOINTS
+          $CFG --enable  CONFIG_UPROBE_EVENTS
+
+          echo "=== [2/4] BBR + CAKE 网络加速 ==="
+          $CFG --enable  CONFIG_TCP_CONG_ADVANCED
+          $CFG --module  CONFIG_TCP_CONG_BBR
+          $CFG --module  CONFIG_NET_SCH_CAKE
+          $CFG --module  CONFIG_NET_SCH_FQ
+          $CFG --module  CONFIG_NET_SCH_FQ_CODEL
+
+          echo "=== [3/4] Docker 官方必须项 ==="
+          $CFG --enable  CONFIG_NAMESPACES
+          $CFG --enable  CONFIG_NET_NS
+          $CFG --enable  CONFIG_PID_NS
+          $CFG --enable  CONFIG_IPC_NS
+          $CFG --enable  CONFIG_UTS_NS
+          $CFG --enable  CONFIG_USER_NS
+          $CFG --enable  CONFIG_CGROUP_CPUACCT
+          $CFG --enable  CONFIG_CGROUP_DEVICE
+          $CFG --enable  CONFIG_CGROUP_FREEZER
+          $CFG --enable  CONFIG_CGROUP_SCHED
+          $CFG --enable  CONFIG_CPUSETS
+          $CFG --enable  CONFIG_MEMCG
+          $CFG --enable  CONFIG_MEMCG_SWAP
+          $CFG --enable  CONFIG_KEYS
+          $CFG --enable  CONFIG_BLK_CGROUP
+          $CFG --enable  CONFIG_BLK_DEV_THROTTLING
+          $CFG --enable  CONFIG_CGROUP_PERF
+          $CFG --enable  CONFIG_CGROUP_HUGETLB
+          $CFG --enable  CONFIG_CFS_BANDWIDTH
+          $CFG --enable  CONFIG_FAIR_GROUP_SCHED
+          $CFG --module  CONFIG_VETH
+          $CFG --module  CONFIG_BRIDGE
+          $CFG --enable  CONFIG_BRIDGE_NETFILTER
+          $CFG --enable  CONFIG_DUMMY
+          $CFG --enable  CONFIG_NETFILTER
+          $CFG --enable  CONFIG_NF_CONNTRACK
+          $CFG --module  CONFIG_NF_NAT
+          $CFG --module  CONFIG_IP_NF_IPTABLES
+          $CFG --module  CONFIG_IP_NF_FILTER
+          $CFG --module  CONFIG_IP_NF_MANGLE
+          $CFG --module  CONFIG_IP_NF_TARGET_MASQUERADE
+          $CFG --module  CONFIG_IP_NF_NAT
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_ADDRTYPE
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_CONNTRACK
+          $CFG --module  CONFIG_NETFILTER_XT_MATCH_IPVS
+          $CFG --module  CONFIG_NETFILTER_XT_MARK
+          $CFG --enable  CONFIG_IP_VS
+          $CFG --enable  CONFIG_IP_VS_NFCT
+          $CFG --enable  CONFIG_IP_VS_PROTO_TCP
+          $CFG --enable  CONFIG_IP_VS_PROTO_UDP
+          $CFG --enable  CONFIG_IP_VS_RR
+          $CFG --module  CONFIG_OVERLAY_FS
+          $CFG --enable  CONFIG_POSIX_MQUEUE
+          $CFG --module  CONFIG_TUN
+          $CFG --enable  CONFIG_SECCOMP
+          $CFG --enable  CONFIG_SECCOMP_FILTER
+          $CFG --enable  CONFIG_EXT4_FS
+          $CFG --enable  CONFIG_EXT4_FS_POSIX_ACL
+          $CFG --enable  CONFIG_EXT4_FS_SECURITY
+
+          echo "=== [4/4] make olddefconfig ==="
           make olddefconfig
+
+          echo "=== 配置验证 ==="
+          for key in \
+            CONFIG_BPF CONFIG_BPF_SYSCALL CONFIG_BPF_JIT \
+            CONFIG_BPF_JIT_ALWAYS_ON CONFIG_CGROUPS CONFIG_KPROBES \
+            CONFIG_NET_INGRESS CONFIG_NET_EGRESS \
+            CONFIG_NET_SCH_INGRESS CONFIG_NET_CLS_BPF \
+            CONFIG_NET_CLS_ACT CONFIG_BPF_STREAM_PARSER \
+            CONFIG_DEBUG_INFO CONFIG_DEBUG_INFO_BTF \
+            CONFIG_KPROBE_EVENTS CONFIG_BPF_EVENTS CONFIG_CGROUP_BPF \
+            CONFIG_SOCK_CGROUP_DATA CONFIG_CGROUP_NET_CLASSID \
+            CONFIG_TCP_CONG_BBR CONFIG_NET_SCH_CAKE \
+            CONFIG_NET_SCH_FQ CONFIG_NET_SCH_FQ_CODEL \
+            CONFIG_NAMESPACES CONFIG_MEMCG CONFIG_OVERLAY_FS \
+            CONFIG_VETH CONFIG_NF_NAT CONFIG_SECCOMP \
+            CONFIG_IKCONFIG CONFIG_IKCONFIG_PROC; do
+            result=$(grep "^${key}=" .config 2>/dev/null || echo "NOT SET")
+            echo "  ${key}: ${result##*=}"
+          done
+
+          grep "CONFIG_DEBUG_INFO_REDUCED" .config \
+            && echo "WARNING: CONFIG_DEBUG_INFO_REDUCED 存在" \
+            || echo "OK: CONFIG_DEBUG_INFO_REDUCED not set"
+          grep "^CONFIG_BPF_LSM=" .config \
+            && echo "WARNING: CONFIG_BPF_LSM 存在，可能变砖" \
+            || echo "OK: CONFIG_BPF_LSM 未启用"
+          grep "^CONFIG_DYNAMIC_FTRACE=" .config \
+            && echo "WARNING: CONFIG_DYNAMIC_FTRACE 存在，可能变砖" \
+            || echo "OK: CONFIG_DYNAMIC_FTRACE 未启用"
+
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: 应用 CPU 超频补丁（极端性能注入）
         id: overclock
-        if: ${{ fromJSON(inputs.enable_overclock) == true && steps.injectconfig.outputs.status == 'success' }}
+        if: ${{ fromJSON(inputs.enable_overclock) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
         env:
           TARGET_MHZ: ${{ inputs.overclock_freq }}
           PATCH_SCRIPT: |
             import re, sys, os, glob
 
-            DTS_DIR = "arch/arm64/boot/dts/qcom"
+            DTS_DIR    = "arch/arm64/boot/dts/qcom"
             TARGET_MHZ = int(sys.argv[1])
-            TARGET_HZ = TARGET_MHZ * 1000000
+            TARGET_HZ  = TARGET_MHZ * 1000000
 
-            # 极端超频档位表（Hz）
-            # 这里的电源域分配参考了酷安 2.1G 调优逻辑
+            # ================================================================
+            # 超频频率档位表（含电源域分配）
+            # 1.5GHz 以下使用 turbo，1.5GHz 及以上使用 super_turbo
+            # 参考：酷安社区 2.1GHz 调优数据 + Qualcomm RPM 电源域规范
+            # ================================================================
             OPP_LEVELS = [
                 (1324800000, "rpmpd_opp_turbo"),
                 (1401600000, "rpmpd_opp_turbo"),
-                (1497600000, "rpmpd_opp_super_turbo"), # 1.5G以上开启超电压模式
+                (1497600000, "rpmpd_opp_super_turbo"),
                 (1593600000, "rpmpd_opp_super_turbo"),
                 (1785600000, "rpmpd_opp_super_turbo"),
                 (1900800000, "rpmpd_opp_super_turbo"),
                 (2016000000, "rpmpd_opp_super_turbo"),
                 (2112000000, "rpmpd_opp_super_turbo"),
             ]
-            levels = [(hz, pwr) for (hz, pwr) in OPP_LEVELS if hz <= TARGET_HZ + 1000000]
+            levels = [(hz, pwr) for (hz, pwr) in OPP_LEVELS if hz <= TARGET_HZ + 1_000_000]
 
-            # 扫描 DTS 获取可用的电源域标签
-            dtsi_files = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi")) + glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
-            pwr_labels = set()
-            cpu_opp_file = None
-            cpu_opp_content = ""
+            if not levels:
+                print(f"ERROR: 目标 {TARGET_MHZ}MHz 低于最小超频档，退出")
+                sys.exit(1)
 
+            # ================================================================
+            # 读取所有相关 dtsi/dts 文件
+            # ================================================================
+            dtsi_files  = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
+            dtsi_files += glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
+
+            all_files = {}
             for fpath in dtsi_files:
                 with open(fpath, "r") as f:
-                    content = f.read()
-                    if "998400000" in content:
-                        cpu_opp_file = fpath
-                        cpu_opp_content = content
-                    for m in re.finditer(r'(rpmpd_opp_\w+)\s*:', content):
-                        pwr_labels.add(m.group(1))
+                    all_files[fpath] = f.read()
 
-            # 电源域降级逻辑（如果super_turbo没定义，回退到turbo）
-            def get_pwr(requested):
-                if requested in pwr_labels: return requested
-                return "rpmpd_opp_turbo" if "rpmpd_opp_turbo" in pwr_labels else "rpmpd_opp_nom"
+            # ================================================================
+            # 扫描电源域标签（rpmpd_opp_xxx）
+            # ================================================================
+            pwr_labels = set()
+            for content in all_files.values():
+                for m in re.finditer(r'(rpmpd_opp_\w+)\s*:', content):
+                    pwr_labels.add(m.group(1))
 
-            # 定位 CPU 表
+            print(f"  [扫描] 电源域标签: {sorted(pwr_labels)}")
+
+            # 电源域降级函数：若请求的标签不存在则自动降级
+            def resolve_pwr(requested):
+                if requested in pwr_labels:
+                    return requested
+                fallback = [
+                    "rpmpd_opp_turbo_krait",
+                    "rpmpd_opp_turbo",
+                    "rpmpd_opp_nom_krait",
+                    "rpmpd_opp_nom",
+                ]
+                for fb in fallback:
+                    if fb in pwr_labels:
+                        print(f"  [降级] {requested} → {fb}")
+                        return fb
+                return requested
+
+            # ================================================================
+            # 定位 CPU OPP 表所在文件
+            # 判断依据：包含 CPU 典型标记频率
+            # ================================================================
+            CPU_MARKER_HZ = [
+                "998400000",
+                "1209600000",
+                "1094400000",
+                "1152000000",
+            ]
+
+            cpu_opp_file    = None
+            cpu_opp_content = None
+
+            for fpath, content in all_files.items():
+                if any(marker in content for marker in CPU_MARKER_HZ):
+                    cpu_opp_file    = fpath
+                    cpu_opp_content = content
+                    print(f"  [定位] CPU OPP 表所在文件: {os.path.basename(fpath)}")
+                    break
+
+            if cpu_opp_file is None:
+                print("ERROR: 未找到包含 CPU OPP 表的文件")
+                sys.exit(1)
+
+            # ================================================================
+            # 找到 CPU 标记频率的字符位置
+            # ================================================================
+            cpu_marker_pos = -1
+            for marker in CPU_MARKER_HZ:
+                pos = cpu_opp_content.find(marker)
+                if pos != -1:
+                    cpu_marker_pos = pos
+                    print(f"  [定位] CPU 标记频率 {marker} 在字符位置: {pos}")
+                    break
+
+            if cpu_marker_pos == -1:
+                print("ERROR: 在文件中找不到 CPU 标记频率")
+                sys.exit(1)
+
+            # ================================================================
+            # ★ 关键修复：向前找距离 CPU 标记频率最近的 opp-table 起始
+            # 遍历所有匹配，取最后一个 start < cpu_marker_pos 的结果
+            # ================================================================
+            table_start_pat = re.compile(
+                r'(?:cpu_opp_table|opp-table)[^{]*\{',
+                re.DOTALL
+            )
             table_start = 0
-            start_m = re.search(r'(?:cpu_opp_table|opp-table)[^{]*\{', cpu_opp_content)
-            if start_m: table_start = start_m.start()
-            
-            # 括号计数找结尾
-            depth, table_end = 0, len(cpu_opp_content)
+            for m in table_start_pat.finditer(cpu_opp_content):
+                if m.start() < cpu_marker_pos:
+                    table_start = m.start()   # 持续更新，保留最靠近的一个
+
+            print(f"  [定位] CPU OPP 表起始位置: {table_start}")
+
+            # ================================================================
+            # 括号计数法找到 CPU OPP table 的精确闭合位置
+            # 只在 CPU OPP table 范围内操作，不越界到 GPU 表
+            # ================================================================
+            depth     = 0
+            table_end = len(cpu_opp_content)
+            in_table  = False
+
             for i, ch in enumerate(cpu_opp_content[table_start:], start=table_start):
-                if ch == '{': depth += 1
+                if ch == '{':
+                    depth    += 1
+                    in_table  = True
                 elif ch == '}':
                     depth -= 1
-                    if depth == 0:
+                    if in_table and depth == 0:
                         table_end = i + 1
                         break
 
-            # 注入新条目
-            opp_block_pat = re.compile(r'\bopp-\d+\s*\{[^{}]*\};', re.DOTALL)
-            cpu_matches = list(opp_block_pat.finditer(cpu_opp_content[table_start:table_end]))
-            insert_pos = table_start + cpu_matches[-1].end()
+            print(f"  [定位] CPU OPP 表结束位置: {table_end}")
 
+            # ================================================================
+            # 在 CPU OPP table 范围内搜索 opp-xxx 块
+            # ================================================================
+            cpu_table_content = cpu_opp_content[table_start:table_end]
+
+            opp_block_pat = re.compile(
+                r'\bopp-\d+\s*\{[^{}]*\};',
+                re.DOTALL
+            )
+            cpu_opp_matches = list(opp_block_pat.finditer(cpu_table_content))
+
+            if not cpu_opp_matches:
+                print("ERROR: 在 CPU OPP 表范围内未找到任何 opp-xxx 块")
+                print(f"  CPU OPP 表内容预览（前500字符）:")
+                print(cpu_table_content[:500])
+                sys.exit(1)
+
+            last_cpu_opp = cpu_opp_matches[-1]
+            insert_pos   = table_start + last_cpu_opp.end()
+
+            print(f"  [定位] CPU OPP 表内共 {len(cpu_opp_matches)} 个条目")
+            print(f"  [定位] 注入绝对位置: {insert_pos}")
+
+            # ================================================================
+            # 幂等检查
+            # ================================================================
             if str(levels[0][0]) in cpu_opp_content:
-                print("Already patched.")
+                print(f"  [跳过] {levels[0][0]//1000000}MHz OPP 已存在，无需重复注入")
                 sys.exit(0)
 
-            insert_block = f"\n\t\t/* extreme overclock: target {TARGET_MHZ}MHz */\n"
+            # ================================================================
+            # 构造新 OPP 块（required-opps 格式，Linux 6.x 主线）
+            # ================================================================
+            insert_block = f"\n\t\t/* extreme overclock: injected by CI, target {TARGET_MHZ}MHz */\n"
             for hz, pwr in levels:
-                p = get_pwr(pwr)
-                insert_block += f"\t\topp-{hz} {{\n\t\t\topp-hz = /bits/ 64 <{hz}>;\n\t\t\trequired-opps = <&{p}>;\n\t\t}};\n"
+                mhz  = hz / 1_000_000
+                rpwr = resolve_pwr(pwr)
+                insert_block += (
+                    f"\t\topp-{hz} {{\n"
+                    f"\t\t\topp-hz = /bits/ 64 <{hz}>;\n"
+                    f"\t\t\trequired-opps = <&{rpwr}>;\n"
+                    f"\t\t}};\n"
+                )
+                print(f"  [注入] {mhz:.1f}MHz → required-opps = <&{rpwr}>")
+
+            # ================================================================
+            # 写入文件
+            # ================================================================
+            new_content = (
+                cpu_opp_content[:insert_pos]
+                + insert_block
+                + cpu_opp_content[insert_pos:]
+            )
 
             with open(cpu_opp_file, "w") as f:
-                f.write(cpu_opp_content[:insert_pos] + insert_block + cpu_opp_content[insert_pos:])
-            print(f"Successfully injected {len(levels)} levels to {cpu_opp_file}")
+                f.write(new_content)
+
+            print(f"\n✅ 超频补丁已写入: {cpu_opp_file}")
+
+            # 验证：只打印 CPU OPP table 范围内的频率
+            new_table = new_content[table_start:table_end + len(insert_block)]
+            print("\n=== 注入后 CPU OPP 频率列表（仅 CPU 表范围）===")
+            for m in opp_block_pat.finditer(new_table):
+                hz_m = re.search(r'opp-hz\s*=\s*/bits/\s*64\s*<(\d+)>', m.group())
+                if hz_m:
+                    hz  = int(hz_m.group(1))
+                    mhz = hz / 1_000_000
+                    tag = " ← 新增" if hz in [h for h, _ in levels] else ""
+                    print(f"  {mhz:.1f} MHz{tag}")
         run: |
           cd /builder/kernel
+
+          echo "════════════════════════════════════════════════"
+          echo "  超频目标: ${TARGET_MHZ} MHz"
+          echo "  警告: MSM8916 原厂最高 1209.6MHz，超频存在损坏风险"
+          echo "════════════════════════════════════════════════"
+
+          echo "注入前 CPU OPP 表:"
+          grep -rn "opp-hz" arch/arm64/boot/dts/qcom/msm8916*.dtsi \
+            2>/dev/null | grep -v "19200000" | tail -10 || true
+
+          echo ""
           printf '%s' "${PATCH_SCRIPT}" > /tmp/patch_opp.py
           python3 /tmp/patch_opp.py "${TARGET_MHZ}"
+
+          echo ""
+          echo "注入后验证:"
+          grep -rn "extreme overclock.*injected" \
+            arch/arm64/boot/dts/qcom/msm8916*.dtsi 2>/dev/null || true
+
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: 注入 No-Modem 补丁
+      - name: 注入 No-Modem 补丁（裁剪 Modem/GPS，释放约 88MB 内存）
         id: nomodem
-        if: ${{ fromJSON(inputs.enable_nomodem) == true }}
+        if: ${{ fromJSON(inputs.enable_nomodem) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
         env:
           NOMODEM_SCRIPT: |
-            import re, os, glob
-            DTS_DIR = "arch/arm64/boot/dts/qcom"
+            import re, sys, os, glob
+
+            DTS_DIR    = "arch/arm64/boot/dts/qcom"
             DEVICE_DTS = os.path.join(DTS_DIR, "msm8916-thwc-ufi001c.dts")
-            RESERVED_MAP = {
-                "mpss@86800000": ["mpss@86800000", "mpss_mem"],
-                "mba@8ea00000": ["mba@8ea00000", "mba_mem"],
-                "wcnss@8b600000": ["wcnss@8b600000", "wcnss_mem"],
-                "rmtfs@86700000": ["rmtfs@86700000", "rmtfs_mem"],
-                "rfsa@867e0000": ["rfsa@867e0000", "rfsa_mem"]
+
+            # reserved-memory 子节点扫描配置
+            # 地址正则要求至少 6 位十六进制，过滤 wcnss@6 等假匹配
+            RESERVED_MEM_LABELS = {
+                "mpss_mem":  ["mpss_mem",  "mpss@"],
+                "mba_mem":   ["mba_mem",   "mba@", "mpss_boot_mem", "mba_region"],
+                "wcnss_mem": ["wcnss_mem", "wcnss@"],
+                "rmtfs_mem": ["rmtfs_mem", "rmtfs@"],
+                "rfsa_mem":  ["rfsa_mem",  "rfsa@"],
             }
-            # 扫描真实节点名
-            found = []
-            dtsi_files = glob.glob(os.path.join(DTS_DIR, "msm8916*.dts*"))
+
+            # 兜底地址（主线 Linux 6.x MSM8916 标准布局）
+            FALLBACK_NODES = {
+                "mpss_mem":  "mpss@86800000",
+                "mba_mem":   "mba@8ea00000",
+                "wcnss_mem": "wcnss@8b600000",
+                "rmtfs_mem": "rmtfs@86700000",
+                "rfsa_mem":  "rfsa@867e0000",
+            }
+
+            REMOTEPROC_CANDIDATES = ["mpss", "wcnss", "hexagon"]
+
+            dtsi_files  = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
+            dtsi_files += glob.glob(os.path.join(DTS_DIR, "msm8916*.dts"))
+
+            all_content = {}
             for fpath in dtsi_files:
                 with open(fpath, "r") as f:
-                    c = f.read()
-                    for k, v_list in RESERVED_MAP.items():
-                        for v in v_list:
-                            m = re.search(r'('+re.escape(v.split("@")[0])+r'@[0-9a-f]{6,})', c)
-                            if m: found.append(m.group(1))
-            
-            patch = "\n/* Step1: Delete remoteproc */\n/delete-node/ &mpss;\n/delete-node/ &wcnss;\n"
-            patch += "\n/* Step2: Delete reserved memory */\n/ {\n\treserved-memory {\n"
-            for node in set(found if found else RESERVED_MAP.keys()):
-                patch += f"\t\t/delete-node/ {node};\n"
-            patch += "\t};\n};\n"
-            
-            with open(DEVICE_DTS, "a") as f: f.write(patch)
+                    all_content[fpath] = f.read()
+
+            # 扫描 reserved-memory 节点名（地址至少 6 位）
+            found_reserved = {}
+            for fpath, content in all_content.items():
+                for label, keywords in RESERVED_MEM_LABELS.items():
+                    if label in found_reserved:
+                        continue
+                    for kw in keywords:
+                        base = kw.rstrip('@')
+                        pat = re.compile(
+                            r'(?:' + re.escape(label) + r'\s*:\s*)?'
+                            r'(' + re.escape(base) + r'@[0-9a-fA-F]{6,})',
+                            re.IGNORECASE
+                        )
+                        m = pat.search(content)
+                        if m:
+                            found_reserved[label] = m.group(1)
+                            print(f"  [扫描] {label} → {m.group(1)} "
+                                  f"({os.path.basename(fpath)})")
+                            break
+
+            # 兜底补全
+            for label, fallback in FALLBACK_NODES.items():
+                if label not in found_reserved:
+                    found_reserved[label] = fallback
+                    print(f"  [兜底] {label} → {fallback}")
+
+            print(f"\n  [确认] 将删除以下 reserved-memory 节点:")
+            for label, node in found_reserved.items():
+                print(f"         {node}")
+
+            # 扫描真实 remoteproc 标签定义
+            found_remoteprocs = []
+            for candidate in REMOTEPROC_CANDIDATES:
+                label_pat = re.compile(
+                    r'\b' + re.escape(candidate) + r'\s*:\s*\w[\w@]*\s*\{'
+                )
+                exists = any(
+                    label_pat.search(content)
+                    for content in all_content.values()
+                )
+                if exists:
+                    found_remoteprocs.append(candidate)
+                    print(f"  [扫描] remoteproc 标签存在: &{candidate}")
+                else:
+                    print(f"  [跳过] &{candidate} 无标签定义")
+
+            # 构造 patch 片段
+            patch_lines = [
+                "",
+                "/*",
+                " * ============================================================",
+                " * nomodem patch - injected by CI workflow at build time",
+                " * 裁剪 Modem/GPS/WCNSS，释放约 88MB reserved-memory",
+                " * 启用后 SIM 卡 / LTE / GPS 功能完全停用",
+                " * ============================================================",
+                " */",
+                "",
+            ]
+
+            if found_remoteprocs:
+                patch_lines.append(
+                    "/* Step1: 整棵删除 remoteproc 节点（含子节点所有 phandle 引用）*/"
+                )
+                for lbl in found_remoteprocs:
+                    patch_lines.append(f"/delete-node/ &{lbl};")
+                    print(f"  [注入] /delete-node/ &{lbl};")
+                patch_lines.append("")
+            else:
+                patch_lines += [
+                    "/* Step1: 整棵删除 remoteproc 节点（兜底）*/",
+                    "/delete-node/ &mpss;",
+                    "",
+                ]
+
+            patch_lines += [
+                "/* Step2: 删除 modem reserved-memory 分区 */",
+                "/ {",
+                "\treserved-memory {",
+            ]
+            for label, node_name in found_reserved.items():
+                patch_lines.append(f"\t\t/delete-node/ {node_name};")
+                print(f"  [注入] /delete-node/ {node_name};")
+            patch_lines += ["\t};", "};", ""]
+
+            # 幂等检查
+            with open(DEVICE_DTS, "r") as f:
+                original = f.read()
+
+            if "nomodem patch - injected by CI" in original:
+                print("  [跳过] nomodem 补丁已存在，无需重复注入")
+                sys.exit(0)
+
+            with open(DEVICE_DTS, "a") as f:
+                f.write("\n".join(patch_lines))
+
+            print(f"\n✅ nomodem 补丁已追加到: {DEVICE_DTS}")
+
+            with open(DEVICE_DTS, "r") as f:
+                lines = f.readlines()
+            print("\n=== 注入后 DTS 末尾 60 行 ===")
+            for line in lines[-60:]:
+                print(line, end="")
         run: |
           cd /builder/kernel
-          python3 -c "${NOMODEM_SCRIPT}"
+
+          echo "════════════════════════════════════════════════"
+          echo "  注入 No-Modem 补丁"
+          echo "  目标: arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          echo "  预期释放: ~88MB reserved-memory"
+          echo "════════════════════════════════════════════════"
+
+          DTS_FILE="arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts"
+          if [ ! -f "${DTS_FILE}" ]; then
+            echo "❌ 设备 DTS 不存在: ${DTS_FILE}"
+            find arch/arm64/boot/dts/qcom/ -name "*ufi*" | head -10 || true
+            exit 1
+          fi
+
+          echo "注入前 modem 相关节点概览:"
+          grep -rn "mpss\|mba_mem\|wcnss\|rmtfs\|rfsa" \
+            arch/arm64/boot/dts/qcom/msm8916*.dtsi \
+            arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dts \
+            2>/dev/null | grep -v "^Binary" | head -40 || true
+
+          echo ""
+          echo "🐍 运行 nomodem 注入脚本..."
+          printf '%s' "${NOMODEM_SCRIPT}" > /tmp/patch_nomodem.py
+          python3 /tmp/patch_nomodem.py
+
+          echo ""
+          echo "注入后验证:"
+          grep -n "delete-node\|delete-property\|status.*disabled" \
+            "${DTS_FILE}" || true
+
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: 编译内核
+      - name: 编译内核（Image.gz + DTB）
+        id: compile
+        if: ${{ steps.injectconfig.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder/kernel
+          export CCACHE_DIR=/builder/kernel/.ccache
+          export PATH="/usr/lib/ccache:$PATH"
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export DTC_FLAGS="-@"
+          make -j$(nproc) Image.gz dtbs
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 打包 deb 安装包
+        id: debpkg
+        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
         run: |
           cd /builder/kernel
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
-          make -j$(nproc) Image.gz dtbs
-          make -j$(nproc) bindeb-pkg LOCALVERSION=-msm8916
-
-      - name: 打包产物
-        id: package
-        run: |
-          cd /builder
-          mkdir -p pkg
-          cp kernel/arch/arm64/boot/Image.gz pkg/
-          cp kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb pkg/
-          cp *.deb pkg/
-          
-          OC_SUFF="${{ inputs.enable_overclock == true && format('-oc{0}', inputs.overclock_freq) || '' }}"
-          NM_SUFF="${{ inputs.enable_nomodem == true && '-nomodem' || '' }}"
-          PKG_NAME="${{ env.kernel_version }}${OC_SUFF}${NM_SUFF}.tar.gz"
-          
-          cd pkg && tar -czf "../${PKG_NAME}" .
-          echo "package_path=/builder/${PKG_NAME}" >> $GITHUB_ENV
+          make -j$(nproc) bindeb-pkg \
+            LOCALVERSION=-msm8916 \
+            KDEB_PKGVERSION=${{ env.kernel_version }}-1 \
+            KDEB_SOURCENAME=linux-msm8916
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: 上传 Release
+      - name: 收集编译产物并打包
+        id: package
+        if: ${{ steps.debpkg.outputs.status == 'success' && !cancelled() }}
+        run: |
+          cd /builder
+          mkdir -p kernel_package
+          cd kernel_package
+
+          KERNEL_VER="${{ env.kernel_version }}"
+
+          if [ "${{ inputs.enable_overclock }}" == "true" ]; then
+            OC_SUFFIX="-oc${{ inputs.overclock_freq }}"
+          else
+            OC_SUFFIX=""
+          fi
+
+          if [ "${{ inputs.enable_nomodem }}" == "true" ]; then
+            NM_SUFFIX="-nomodem"
+          else
+            NM_SUFFIX=""
+          fi
+
+          PACKAGE_NAME="${KERNEL_VER}${OC_SUFFIX}${NM_SUFFIX}.tar.gz"
+          echo "📦 产物包名: ${PACKAGE_NAME}"
+
+          cp /builder/kernel/arch/arm64/boot/dts/qcom/msm8916-thwc-ufi001c.dtb ./
+          cp /builder/kernel/arch/arm64/boot/Image.gz ./
+
+          find /builder -maxdepth 1 \
+            -name "linux-headers-*${KERNEL_VER}*.deb" ! -name "*dbg*" \
+            -type f -exec cp {} ./linux-headers.deb \;
+
+          find /builder -maxdepth 1 \
+            -name "linux-image-*${KERNEL_VER}*.deb" ! -name "*dbg*" \
+            -type f -exec cp {} ./linux-image.deb \;
+
+          ls -la ./
+
+          for f in msm8916-thwc-ufi001c.dtb Image.gz linux-headers.deb linux-image.deb; do
+            [ -f "$f" ] || { echo "缺少文件: $f"; exit 1; }
+          done
+
+          tar -czf "${PACKAGE_NAME}" \
+            msm8916-thwc-ufi001c.dtb \
+            Image.gz \
+            linux-headers.deb \
+            linux-image.deb
+
+          echo "package_path=/builder/kernel_package/${PACKAGE_NAME}" >> ${GITHUB_ENV}
+          echo "package_name=${PACKAGE_NAME}" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: 上传内核到 Release
         uses: ophub/upload-to-releases@main
+        if: ${{ steps.package.outputs.status == 'success' && !cancelled() }}
         with:
           tag: kernel_stable
           artifacts: ${{ env.package_path }}
           allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: false
           gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ## MSM8916 主线 LTS 内核
+
+            - DAE / daed eBPF 透明代理完整支持
+            - SOCK_OPS / BPF_STREAM_PARSER（daed 面板支持）
+            - Docker 容器化完整支持
+            - BTF + CO-RE eBPF 可移植性
+            - BBR 拥塞控制算法
+            - CAKE 队列调度器
+            - ikconfig 支持 /proc/config.gz
+
+            ## 刷机后验证
+            ```
+            cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+            cat /sys/class/thermal/thermal_zone0/temp
+            sysctl net.ipv4.tcp_congestion_control
+            ```
