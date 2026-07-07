@@ -385,8 +385,8 @@ jobs:
             DEVICE_DTS = os.path.join(DTS_DIR, "msm8916-thwc-ufi001c.dts")
 
             # ================================================================
-            # reserved-memory 子节点：只能用 /delete-node/ 删除
-            # 这些节点没有独立的 DTS 标签，不能用 &label 引用
+            # reserved-memory 子节点：只能 /delete-node/ 删除
+            # 这类节点没有独立 DTS 标签，不能用 &label 引用
             # ================================================================
             RESERVED_MEM_LABELS = {
                 "mpss_mem":  ["mpss_mem",  "mpss@"],
@@ -397,15 +397,11 @@ jobs:
             }
 
             # ================================================================
-            # 真正的设备节点（remoteproc / subsystem）：
-            # 必须先清理 memory-region phandle，再 status = disabled
-            # 判断依据：在 dtsi 中存在 "label: { ... }" 形式的标签定义
+            # remoteproc 设备节点候选：用 /delete-node/ &label; 整棵删除
+            # 整棵删除可以同时消灭所有子节点中的 phandle 引用
+            # 不再使用 status=disabled + delete-property，避免子节点遗漏
             # ================================================================
-            DEVICE_NODE_CANDIDATES = [
-                # (标签名, 是否有 memory-region 属性)
-                ("mpss",   True),
-                ("wcnss",  True),
-            ]
+            REMOTEPROC_CANDIDATES = ["mpss", "wcnss", "hexagon"]
 
             # ── 读取所有相关 dtsi/dts 文件 ──────────────────────────────────
             dtsi_files  = glob.glob(os.path.join(DTS_DIR, "msm8916*.dtsi"))
@@ -435,24 +431,22 @@ jobs:
                                   f"{m.group(1)} ({os.path.basename(fpath)})")
                             break
 
-            # ── 第二步：扫描真实设备节点标签（必须是 label: node { 形式）───
-            # 正则：label后跟冒号，再跟空白+标识符+空白+{
-            # 例: mpss: remoteproc@4080000 {
-            found_device_nodes = []   # [(label, has_memory_region)]
-            for (candidate, has_mem) in DEVICE_NODE_CANDIDATES:
-                label_def_pat = re.compile(
+            # ── 第二步：扫描真实 remoteproc 标签定义 ────────────────────────
+            # 必须是 "label: nodename@addr {" 形式，确认标签真实存在
+            found_remoteprocs = []
+            for candidate in REMOTEPROC_CANDIDATES:
+                label_pat = re.compile(
                     r'\b' + re.escape(candidate) + r'\s*:\s*\w[\w@]*\s*\{'
                 )
                 exists = any(
-                    label_def_pat.search(content)
+                    label_pat.search(content)
                     for content in all_content.values()
                 )
                 if exists:
-                    found_device_nodes.append((candidate, has_mem))
-                    print(f"  [扫描] 设备节点标签存在: &{candidate} "
-                          f"(has memory-region: {has_mem})")
+                    found_remoteprocs.append(candidate)
+                    print(f"  [扫描] remoteproc 标签存在: &{candidate}")
                 else:
-                    print(f"  [跳过] &{candidate} 无标签定义，不生成 override 块")
+                    print(f"  [跳过] &{candidate} 无标签定义，不生成 delete-node")
 
             # ── 第三步：构造追加到设备 DTS 末尾的 patch 片段 ────────────────
             patch_lines = [
@@ -467,35 +461,28 @@ jobs:
                 "",
             ]
 
-            # 3-A：先清理设备节点的 phandle 引用并禁用
-            #      必须在删除 reserved-memory 节点之前，防止 phandle 悬空
-            if found_device_nodes:
-                for (lbl, has_mem) in found_device_nodes:
-                    patch_lines.append(f"/* disable remoteproc: {lbl} */")
-                    patch_lines.append(f"&{lbl} {{")
-                    if has_mem:
-                        patch_lines.append("\t/delete-property/ memory-region;")
-                        print(f"  [注入] &{lbl}: /delete-property/ memory-region")
-                    patch_lines.append("\t/delete-property/ firmware-name;")
-                    patch_lines.append("\tstatus = \"disabled\";")
-                    patch_lines.append("};")
-                    patch_lines.append("")
+            # 3-A：整棵删除 remoteproc 节点
+            #      /delete-node/ &label; 会删除该节点及其所有子节点
+            #      子节点中的 memory-region phandle 引用也会一并消除
+            #      必须在删除 reserved-memory 节点之前执行
+            if found_remoteprocs:
+                patch_lines.append("/* Step1: 整棵删除 remoteproc 节点（含子节点所有 phandle 引用）*/")
+                for lbl in found_remoteprocs:
+                    patch_lines.append(f"/delete-node/ &{lbl};")
+                    print(f"  [注入] /delete-node/ &{lbl};")
+                patch_lines.append("")
             else:
-                # 兜底：至少处理 mpss
-                print("  [兜底] 未扫描到设备节点，直接禁用 &mpss")
+                # 兜底：直接删除 &mpss
+                print("  [兜底] 未扫描到 remoteproc 标签，直接删除 &mpss")
                 patch_lines += [
-                    "/* disable remoteproc: mpss (fallback) */",
-                    "&mpss {",
-                    "\t/delete-property/ memory-region;",
-                    "\t/delete-property/ firmware-name;",
-                    "\tstatus = \"disabled\";",
-                    "};",
+                    "/* Step1: 整棵删除 remoteproc 节点（兜底）*/",
+                    "/delete-node/ &mpss;",
                     "",
                 ]
 
-            # 3-B：再删除 reserved-memory 中的节点
+            # 3-B：删除 reserved-memory 中的节点
             patch_lines += [
-                "/* remove modem reserved-memory regions */",
+                "/* Step2: 删除 modem reserved-memory 分区 */",
                 "/ {",
                 "\treserved-memory {",
             ]
@@ -505,7 +492,7 @@ jobs:
                     patch_lines.append(f"\t\t/delete-node/ {node_name};")
                     print(f"  [注入] /delete-node/ {node_name};")
             else:
-                print("  [警告] 未扫描到 reserved-memory 节点地址，使用兜底地址")
+                print("  [警告] 未扫描到节点地址，使用已知主线兜底地址")
                 for line in [
                     "/delete-node/ mpss@86800000;",
                     "/delete-node/ mba@8ea00000;",
@@ -566,7 +553,7 @@ jobs:
 
           echo ""
           echo "注入后验证:"
-          grep -n "delete-property\|delete-node\|status.*disabled" \
+          grep -n "delete-node\|delete-property\|status.*disabled" \
             "${DTS_FILE}" || true
 
           echo "status=success" >> ${GITHUB_OUTPUT}
