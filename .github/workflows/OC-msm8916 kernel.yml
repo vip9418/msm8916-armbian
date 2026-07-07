@@ -286,7 +286,8 @@ jobs:
 
       - name: 应用 CPU 超频补丁（实验性）
         id: overclock
-        if: ${{ inputs.enable_overclock == 'true' && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
+        # ✅ 核心修复：fromJSON() 强制将 boolean 输入解析为真正的布尔值再比较
+        if: ${{ fromJSON(inputs.enable_overclock) == true && steps.injectconfig.outputs.status == 'success' && !cancelled() }}
         env:
           TARGET_MHZ: ${{ inputs.overclock_freq }}
           PATCH_SCRIPT: |
@@ -409,7 +410,7 @@ jobs:
 
           KERNEL_VER="${{ env.kernel_version }}"
 
-          # ✅ 根据是否超频生成带标识的文件名后缀
+          # run: 脚本内插值后为字符串，== 'true' 在此处正确
           if [ "${{ inputs.enable_overclock }}" == "true" ]; then
             SUFFIX="-oc${{ inputs.overclock_freq }}"
           else
