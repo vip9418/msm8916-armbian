@@ -338,10 +338,11 @@ jobs:
             # 选择最高档电源域
             PRIORITY = [
                 "rpmpd_opp_turbo_krait",
+                "rpmpd_opp_super_turbo",
                 "rpmpd_opp_turbo",
                 "rpmpd_opp_nom_krait",
                 "rpmpd_opp_nom",
-            ]
+              ]
             OC_PWR = None
             for p in PRIORITY:
                 if p in pwr_labels:
