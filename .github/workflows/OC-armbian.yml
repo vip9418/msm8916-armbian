@@ -17,14 +17,18 @@ on:
         default: "normal"
         type: choice
         options:
-          - normal                # 6.18.x.tar.gz
-          - nomodem               # 6.18.x-nomodem.tar.gz           （裁剪modem）
-          - oc1400                # 6.18.x-oc1400.tar.gz
-          - oc1600                # 6.18.x-oc1600.tar.gz
-          - oc1900                # 6.18.x-oc1900.tar.gz
-          - oc1400-nomodem        # 6.18.x-oc1400-nomodem.tar.gz
-          - oc1600-nomodem        # 6.18.x-oc1600-nomodem.tar.gz
-          - oc1900-nomodem        # 6.18.x-oc1900-nomodem.tar.gz
+          - normal
+          - nomodem
+          - oc1400
+          - oc1600
+          - oc1800
+          - oc2000
+          - oc2100
+          - oc1400-nomodem
+          - oc1600-nomodem
+          - oc1800-nomodem
+          - oc2000-nomodem
+          - oc2100-nomodem
       retry_count:
         description: "网络下载失败时的最大重试次数"
         required: false
